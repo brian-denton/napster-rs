@@ -33,9 +33,34 @@ pub struct ClientConfig {
     pub cache_library: bool,
     /// Connect when the app starts (the original did).
     pub auto_connect: bool,
-    /// Cap on each upload's speed in KB/s (0 = unlimited).
+    /// Limit transfers to what `link_speed` really delivered around
+    /// 1999-2001 (see [`PERIOD_RATES`]). Overrides the manual limits.
+    pub authentic_speeds: bool,
+    /// Total download speed cap in KB/s across all transfers (0 = unlimited).
+    /// Used when `authentic_speeds` is off.
+    pub download_limit_kbps: u32,
+    /// Total upload speed cap in KB/s across all transfers (0 = unlimited).
+    /// Used when `authentic_speeds` is off.
     pub upload_limit_kbps: u32,
 }
+
+/// Typical sustained throughput in KB/s (download, upload) for each link
+/// type, indexed like [`napster_proto::LINK_SPEEDS`]. Modems never reached
+/// their rated speed, and 56K modems uploaded at 33.6K at best; home
+/// DSL and cable of the era had small upload caps.
+pub const PERIOD_RATES: [(f32, f32); 11] = [
+    (0.0, 0.0),       // Unknown: unlimited
+    (1.6, 1.6),       // 14.4 Kbps
+    (3.2, 3.2),       // 28.8 Kbps
+    (3.8, 3.6),       // 33.6 Kbps
+    (5.0, 3.5),       // 56K (V.90)
+    (7.5, 7.5),       // ISDN-64K
+    (15.0, 15.0),     // ISDN-128K
+    (150.0, 16.0),    // Cable (~1.5 Mbps / 128 Kbps)
+    (90.0, 15.0),     // DSL (~768 / 128 Kbps)
+    (180.0, 180.0),   // T1 (1.544 Mbps)
+    (5000.0, 5000.0), // T3 (45 Mbps)
+];
 
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -62,6 +87,8 @@ impl Default for ClientConfig {
             bind_host: "0.0.0.0".into(),
             cache_library: true,
             auto_connect: true,
+            authentic_speeds: true,
+            download_limit_kbps: 0,
             upload_limit_kbps: 0,
         }
     }
@@ -71,6 +98,16 @@ impl ClientConfig {
     /// Directory where partial downloads live until complete.
     pub fn incomplete_dir(&self) -> PathBuf {
         self.download_dir.join("Incomplete")
+    }
+
+    /// Effective (download, upload) caps in bytes per second; 0 = none.
+    pub fn rate_limits(&self) -> (u64, u64) {
+        if self.authentic_speeds {
+            let (down, up) = PERIOD_RATES.get(self.link_speed as usize).copied().unwrap_or((0.0, 0.0));
+            ((down * 1024.0) as u64, (up * 1024.0) as u64)
+        } else {
+            (self.download_limit_kbps as u64 * 1024, self.upload_limit_kbps as u64 * 1024)
+        }
     }
 
     pub fn default_path() -> PathBuf {

@@ -8,10 +8,11 @@ pub mod config;
 mod engine;
 pub mod library;
 pub mod mp3;
+mod throttle;
 mod transfer;
 pub mod types;
 
-pub use config::ClientConfig;
+pub use config::{ClientConfig, PERIOD_RATES};
 pub use engine::Client;
 pub use types::*;
 

@@ -15,6 +15,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::Shared;
+use crate::throttle;
 use crate::types::*;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -177,26 +178,20 @@ async fn send_file<W: AsyncWrite + Unpin>(
     });
     let result: std::io::Result<u64> = async {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let limit = shared.config().upload_limit_kbps as u64 * 1024;
-        // with a limit, send in quarter-second slices so the rate is smooth
-        let chunk = if limit > 0 { (limit / 4).clamp(1024, CHUNK as u64) as usize } else { CHUNK };
-        let mut buf = vec![0u8; chunk];
+        let mut buf = vec![0u8; CHUNK];
         let mut sent = 0u64;
         let mut last = Instant::now();
-        let began = Instant::now();
         loop {
-            if limit > 0 {
-                let due = Duration::from_secs_f64(sent as f64 / limit as f64);
-                if let Some(wait) = due.checked_sub(began.elapsed()) {
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(std::io::Error::other("cancelled")),
-                        _ = tokio::time::sleep(wait) => {}
-                    }
-                }
-            }
-            let n = file.read(&mut buf).await?;
+            // limits are re-read every slice so preference changes apply live
+            let rate = shared.rate_limits().1;
+            let chunk = throttle::chunk_size(rate, CHUNK);
+            let n = file.read(&mut buf[..chunk]).await?;
             if n == 0 {
                 break;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(std::io::Error::other("cancelled")),
+                _ = shared.up_throttle.take(n, rate) => {}
             }
             tokio::select! {
                 _ = cancel.cancelled() => return Err(std::io::Error::other("cancelled")),
@@ -371,16 +366,22 @@ async fn receive_data(
     let mut last = Instant::now();
     let result: anyhow::Result<()> = async {
         while got < want {
+            // reading slowly makes TCP slow the sender down too
+            let rate = shared.rate_limits().0;
+            let chunk = throttle::chunk_size(rate, CHUNK).min((want - got) as usize);
             let n = tokio::select! {
                 _ = cancel.cancelled() => anyhow::bail!("cancelled"),
-                r = timeout(STALL_TIMEOUT, stream.read(&mut buf)) => r.map_err(|_| anyhow::anyhow!("timed out waiting for data"))??,
+                r = timeout(STALL_TIMEOUT, stream.read(&mut buf[..chunk])) => r.map_err(|_| anyhow::anyhow!("timed out waiting for data"))??,
             };
             if n == 0 {
                 anyhow::bail!("TCP socket went down at: {} bytes", offset + got);
             }
-            let n = n.min((want - got) as usize);
             file.write_all(&buf[..n]).await?;
             got += n as u64;
+            tokio::select! {
+                _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+                _ = shared.down_throttle.take(n, rate) => {}
+            }
             if last.elapsed() > PROGRESS_EVERY {
                 last = Instant::now();
                 shared.update(id, |t| t.transferred = got);

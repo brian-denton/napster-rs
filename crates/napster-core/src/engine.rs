@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
 use crate::library::{self, Library};
+use crate::throttle::Throttle;
 use crate::transfer;
 use crate::types::*;
 
@@ -49,6 +50,9 @@ pub(crate) struct Shared {
     pub pending_pushes: Mutex<HashMap<(String, String), u64>>,
     /// Nicks we've asked for a direct browse.
     pub pending_browses: Mutex<HashSet<String>>,
+    /// Bandwidth shared by all downloads / all uploads.
+    pub down_throttle: Throttle,
+    pub up_throttle: Throttle,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -84,6 +88,11 @@ impl Shared {
 
     pub fn config(&self) -> ClientConfig {
         lock(&self.config).clone()
+    }
+
+    /// Current (download, upload) caps in bytes/second; 0 = unlimited.
+    pub fn rate_limits(&self) -> (u64, u64) {
+        lock(&self.config).rate_limits()
     }
 
     pub fn new_transfer(
@@ -226,6 +235,8 @@ impl Client {
             data_port: Mutex::new(0),
             pending_pushes: Mutex::new(HashMap::new()),
             pending_browses: Mutex::new(HashSet::new()),
+            down_throttle: Throttle::default(),
+            up_throttle: Throttle::default(),
         });
         tokio::spawn(Actor::new(shared, rx).run());
         (Client { tx }, erx)

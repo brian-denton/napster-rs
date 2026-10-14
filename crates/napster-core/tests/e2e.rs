@@ -39,11 +39,15 @@ struct Peer {
 
 impl Peer {
     async fn new(nick: &str, server: SocketAddr, firewalled: bool) -> Peer {
+        Self::with(nick, server, firewalled, |_| {}).await
+    }
+
+    async fn with(nick: &str, server: SocketAddr, firewalled: bool, tweak: impl FnOnce(&mut ClientConfig)) -> Peer {
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("shared");
         let downloads = dir.path().join("downloads");
         std::fs::create_dir_all(&shared).unwrap();
-        let config = ClientConfig {
+        let mut config = ClientConfig {
             nick: nick.into(),
             password: "secret".into(),
             server: server.to_string(),
@@ -52,8 +56,10 @@ impl Peer {
             shared_dirs: vec![shared.clone()],
             download_dir: downloads.clone(),
             cache_library: false,
+            authentic_speeds: false,
             ..ClientConfig::default()
         };
+        tweak(&mut config);
         let (client, events) = Client::start(config, None);
         Peer { client, events, _dir: dir, shared, downloads }
     }
@@ -303,6 +309,7 @@ async fn login_via_metaserver_and_bad_password() {
         shared_dirs: vec![],
         download_dir: dir.path().to_path_buf(),
         cache_library: false,
+        authentic_speeds: false,
         ..ClientConfig::default()
     };
     let (client, mut events) = Client::start(config.clone(), None);
@@ -332,4 +339,49 @@ async fn login_via_metaserver_and_bad_password() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_limit_is_enforced() {
+    let (server, _) = start_server().await;
+    let mut alice = Peer::new("alice", server, false).await;
+    // 100 KB/s cap on bob's downloads
+    let mut bob = Peer::with("bob", server, false, |c| c.download_limit_kbps = 100).await;
+    let data = song(600); // ~250 KB
+    alice.share("capped.mp3", &data);
+    alice.rescan(1).await;
+    alice.connect().await;
+    bob.connect().await;
+    let r = bob.search_until("capped", 1).await.remove(0);
+    let start = std::time::Instant::now();
+    let saved = bob.download(&r).await;
+    let secs = start.elapsed().as_secs_f64();
+    assert_same(&saved, &data);
+    // 250 KB at 100 KB/s is ~2.5 s (less a quarter second of burst)
+    assert!(secs > 1.8 && secs < 10.0, "took {secs:.2}s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authentic_speeds_follow_line_speed() {
+    let (server, _) = start_server().await;
+    // a 33.6K modem uploads at ~3.6 KB/s
+    let mut alice = Peer::with("alice", server, false, |c| {
+        c.authentic_speeds = true;
+        c.link_speed = 3;
+    })
+    .await;
+    let mut bob = Peer::new("bob", server, false).await;
+    let data = song(20); // ~8 KB
+    alice.share("modem.mp3", &data);
+    alice.rescan(1).await;
+    alice.connect().await;
+    bob.connect().await;
+    let r = bob.search_until("modem", 1).await.remove(0);
+    assert_eq!(r.link_speed, 3);
+    let start = std::time::Instant::now();
+    let saved = bob.download(&r).await;
+    let secs = start.elapsed().as_secs_f64();
+    assert_same(&saved, &data);
+    // 8.3 KB at 3.6 KB/s is ~2.3 s
+    assert!(secs > 1.6 && secs < 10.0, "took {secs:.2}s");
 }

@@ -92,6 +92,55 @@ napster-cli --server myhost:8888 --nick bob --password pw --share D:\Music
 Then use `/search beatles`, `/get 1 2`, `/transfers`, `/join Lobby`, and so
 on. `/help` lists everything.
 
+## Authentic 1999 speeds
+
+In the original client, **Line Speed** was only a label: you could claim
+T1 while on a 28.8 modem. In napster-rs it really limits your transfers,
+so downloading a song can take as long as it did then. This is on by
+default. To turn it off, uncheck **Authentic speeds** in Preferences >
+Transfer Settings, or pass `--modern-speeds` to the CLI.
+
+| Line Speed | Downloads | Uploads | One 4 MB song |
+|---|---|---|---|
+| 14.4 Kbps | 1.6 KB/s | 1.6 KB/s | ~43 min |
+| 28.8 Kbps | 3.2 KB/s | 3.2 KB/s | ~21 min |
+| 33.6 Kbps | 3.8 KB/s | 3.6 KB/s | ~18 min |
+| 56K | 5.0 KB/s | 3.5 KB/s | ~14 min |
+| ISDN-64K | 7.5 KB/s | 7.5 KB/s | ~9 min |
+| ISDN-128K | 15 KB/s | 15 KB/s | ~4.5 min |
+| Cable | 150 KB/s | 16 KB/s | ~27 s |
+| DSL | 90 KB/s | 15 KB/s | ~45 s |
+| T1 | 180 KB/s | 180 KB/s | ~23 s |
+| T3 | 5,000 KB/s | 5,000 KB/s | <1 s |
+| Unknown | unlimited | unlimited | |
+
+These are the speeds connections of the time actually sustained, not
+their advertised ratings:
+
+* Modems never reached their rated speed.
+* 56K modems could only send at 33.6K.
+* Home DSL and cable had fast downloads but uploads capped near 128 Kbps.
+
+Things that work the way they did on a real connection:
+
+* **One shared line.** The limit covers all your transfers together.
+  Two downloads on 56K each get about 2.5 KB/s.
+* **The slower side sets the pace.** If you're on DSL and download
+  from someone on 56K, you get their 3.5 KB/s upload speed.
+* **Changes apply right away.** A new Line Speed takes effect on
+  transfers already in progress.
+
+With authentic speeds off, you can set your own totals instead: **Max
+Download Speed** and **Max Upload Speed** in KB/s, where 0 means
+unlimited. On the CLI, use `--download-limit` and `--upload-limit`.
+
+```bash
+napster-cli --line-speed 4 --server myhost:8888 --nick modemguy --password pw
+```
+
+`--line-speed` takes 0–10: 0 Unknown, 1 14.4, 2 28.8, 3 33.6, 4 56K,
+5 ISDN-64K, 6 ISDN-128K, 7 Cable, 8 DSL, 9 T1, 10 T3.
+
 ## Using the original 2001 client
 
 The b10 client has `server.napster.com` (and `server2.napster.com`) built

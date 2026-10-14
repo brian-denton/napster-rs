@@ -1709,12 +1709,6 @@ impl App {
                         draft.max_uploads = up.trim().parse().unwrap_or(0).min(50);
                     }
                     ui.end_row();
-                    ui.label("Max Upload Speed per transfer (KB/s, 0 = unlimited):");
-                    let mut lim = draft.upload_limit_kbps.to_string();
-                    if classic::text_field(ui, &mut lim, 50.0).changed() {
-                        draft.upload_limit_kbps = lim.trim().parse().unwrap_or(0);
-                    }
-                    ui.end_row();
                     ui.label("Max Simultaneous Downloads (rest will be queued):");
                     let mut down = draft.max_downloads.to_string();
                     if classic::text_field(ui, &mut down, 50.0).changed() {
@@ -1724,6 +1718,37 @@ impl App {
                 });
                 if draft.max_uploads == 0 {
                     ui.colored_label(C_ERROR, "Your file server is currently disabled (max outbound transfers = 0).");
+                }
+                ui.add_space(4.0);
+                ui.checkbox(&mut draft.authentic_speeds, "Authentic speeds: transfer at the real speed of my Line Speed");
+                if draft.authentic_speeds {
+                    let (d, u) = napster_core::PERIOD_RATES[draft.link_speed.min(10) as usize];
+                    let text = if d == 0.0 {
+                        "Line Speed is Unknown, so transfers are not limited.".to_owned()
+                    } else {
+                        format!(
+                            "{}: downloads up to {} KB/s, uploads up to {} KB/s (shared by all transfers).",
+                            link_speed_name(draft.link_speed),
+                            d,
+                            u
+                        )
+                    };
+                    ui.label(RichText::new(text).color(C_SYSTEM));
+                } else {
+                    egui::Grid::new("limits").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                        ui.label("Max Download Speed, all transfers (KB/s, 0 = unlimited):");
+                        let mut lim = draft.download_limit_kbps.to_string();
+                        if classic::text_field(ui, &mut lim, 60.0).changed() {
+                            draft.download_limit_kbps = lim.trim().parse().unwrap_or(0);
+                        }
+                        ui.end_row();
+                        ui.label("Max Upload Speed, all transfers (KB/s, 0 = unlimited):");
+                        let mut lim = draft.upload_limit_kbps.to_string();
+                        if classic::text_field(ui, &mut lim, 60.0).changed() {
+                            draft.upload_limit_kbps = lim.trim().parse().unwrap_or(0);
+                        }
+                        ui.end_row();
+                    });
                 }
                 ui.label(
                     RichText::new("Data Port 0 means you are behind a firewall; your uploads will be pushed.")

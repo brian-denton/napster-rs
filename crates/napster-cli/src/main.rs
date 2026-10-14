@@ -33,9 +33,18 @@ struct Args {
     /// Data port for transfers; 0 = firewalled.
     #[arg(long)]
     data_port: Option<u16>,
-    /// Limit each upload to this many KB/s (0 = unlimited).
+    /// Total upload cap in KB/s (0 = unlimited). Implies --modern-speeds.
     #[arg(long)]
     upload_limit: Option<u32>,
+    /// Total download cap in KB/s (0 = unlimited). Implies --modern-speeds.
+    #[arg(long)]
+    download_limit: Option<u32>,
+    /// Your connection type, 0-10 (4 = 56K, 8 = DSL); see `napster-cli --help`.
+    #[arg(long)]
+    line_speed: Option<u32>,
+    /// Don't throttle transfers to the line speed's period-accurate rate.
+    #[arg(long)]
+    modern_speeds: bool,
     /// Interface for the data port listener (default 0.0.0.0).
     #[arg(long)]
     bind_host: Option<String>,
@@ -96,8 +105,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(p) = args.data_port {
         config.data_port = p;
     }
+    if let Some(l) = args.line_speed {
+        config.link_speed = l.min(10);
+    }
+    if args.modern_speeds || args.upload_limit.is_some() || args.download_limit.is_some() {
+        config.authentic_speeds = false;
+    }
     if let Some(l) = args.upload_limit {
         config.upload_limit_kbps = l;
+    }
+    if let Some(l) = args.download_limit {
+        config.download_limit_kbps = l;
     }
     if let Some(h) = args.bind_host {
         config.bind_host = h;
@@ -106,6 +124,15 @@ async fn main() -> anyhow::Result<()> {
         config.save(&path)?;
     }
     println!("{} — type /help", napster_core::CLIENT_INFO);
+    let (down, up) = config.rate_limits();
+    let fmt = |b: u64| if b == 0 { "unlimited".to_owned() } else { format!("{:.1} KB/s", b as f64 / 1024.0) };
+    println!(
+        "line speed {}: downloads {}, uploads {}{}",
+        link_speed_name(config.link_speed),
+        fmt(down),
+        fmt(up),
+        if config.authentic_speeds { " (authentic speeds)" } else { "" }
+    );
     println!(
         "server {}{}, nick {:?}, data port {}, sharing {:?}",
         config.server,
