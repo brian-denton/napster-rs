@@ -16,6 +16,9 @@ use crate::mp3;
 /// The Windows client hashes this many bytes, starting at the first frame.
 pub const HASH_LEN: usize = 299_008;
 
+/// A file we share. `info.filename` is the name other users see
+/// (`<shared folder>\\<path inside it>`); `path` is where it really is,
+/// which never leaves this computer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedFile {
     pub info: FileInfo,
@@ -153,13 +156,52 @@ fn walk(dir: &Path, exts: &[String], out: &mut Vec<PathBuf>, depth: usize) {
 
 /// Scan `dirs` for shareable files. `progress(done, total)` is called as
 /// files are hashed. Blocking; run it on a blocking thread.
+/// Names shown for each shared folder: its own name, made unique.
+fn root_labels(dirs: &[PathBuf]) -> Vec<String> {
+    let mut used: HashMap<String, usize> = HashMap::new();
+    dirs.iter()
+        .map(|d| {
+            let base = d
+                .file_name()
+                .map(|n| n.to_string_lossy().replace(['\\', '/'], "_"))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Shared".into());
+            let n = used.entry(base.to_lowercase()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                base
+            } else {
+                format!("{base} ({n})")
+            }
+        })
+        .collect()
+}
+
+/// What other users see for `path` under shared folder `root`: the
+/// folder's label and the path inside it, never the full local path
+/// (which would reveal e.g. the Windows user name).
+pub fn shared_name(label: &str, root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    format!("{label}\\{}", parts.join("\\"))
+}
+
 pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: impl FnMut(usize, usize)) -> Library {
-    let mut paths = Vec::new();
-    for d in dirs {
-        walk(d, exts, &mut paths, 0);
+    // (real path, name we advertise)
+    let mut paths: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (d, label) in dirs.iter().zip(root_labels(dirs)) {
+        let mut found = Vec::new();
+        walk(d, exts, &mut found, 0);
+        found.sort();
+        for p in found {
+            // a folder shared twice (or nested in another) counts once
+            if seen.insert(p.clone()) {
+                let name = shared_name(&label, d, &p);
+                paths.push((p, name));
+            }
+        }
     }
-    paths.sort();
-    paths.dedup();
     let mut cache: HashMap<String, CacheEntry> = if use_cache {
         std::fs::read(cache_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     } else {
@@ -167,7 +209,7 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
     };
     let mut files = Vec::with_capacity(paths.len());
     let total = paths.len();
-    for (i, path) in paths.into_iter().enumerate() {
+    for (i, (path, name)) in paths.into_iter().enumerate() {
         progress(i, total);
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let mtime =
@@ -176,7 +218,7 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
         if let Some(c) = cache.get(&key).filter(|c| c.size == meta.len() && c.mtime == mtime) {
             files.push(SharedFile {
                 info: FileInfo {
-                    filename: key,
+                    filename: name,
                     md5: c.md5.clone(),
                     size: c.size,
                     bitrate: c.bitrate,
@@ -188,7 +230,8 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
             continue;
         }
         match describe(&path) {
-            Ok(Some(info)) => {
+            Ok(Some(mut info)) => {
+                info.filename = name;
                 cache.insert(
                     key,
                     CacheEntry {
@@ -224,6 +267,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn labels_are_unique() {
+        let dirs = [PathBuf::from("/a/Music"), PathBuf::from("/b/music"), PathBuf::from("/c/Songs")];
+        assert_eq!(root_labels(&dirs), vec!["Music", "music (2)", "Songs"]);
+        assert_eq!(
+            shared_name("Music", Path::new("/x/Music"), Path::new("/x/Music/Band/Song.mp3")),
+            "Music\\Band\\Song.mp3"
+        );
+    }
+
+    #[test]
     fn scan_and_describe() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("Artist");
@@ -234,6 +287,11 @@ mod tests {
         let lib = scan(&[dir.path().to_path_buf()], &["mp3".into()], false, |_, _| {});
         assert_eq!(lib.len(), 1);
         let f = &lib.files()[0];
+        // the advertised name hides where the folder really is
+        let label = dir.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(f.info.filename, format!("{label}\\Artist\\Song.mp3"));
+        assert!(!f.info.filename.contains(&*dir.path().parent().unwrap().to_string_lossy()));
+        assert_eq!(f.path, sub.join("Song.mp3"));
         assert_eq!(f.info.bitrate, 128);
         assert_eq!(f.info.frequency, 44100);
         assert_eq!(f.info.seconds, 52);

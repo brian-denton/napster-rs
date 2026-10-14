@@ -423,6 +423,11 @@ impl Actor {
                 }
             }
             Command::Browse(nick) => {
+                if nick.eq_ignore_ascii_case(&s.my_nick()) {
+                    s.emit(Event::Error("That's you! Your own files are in the Library tab.".into()));
+                    s.emit(Event::BrowseEnd { nick });
+                    return;
+                }
                 lock(&s.pending_browses).insert(nick.to_lowercase());
                 if !s.send(msg::DIRECT_BROWSE, nick) {
                     s.emit(Event::Error("Not connected to Server!".into()));
@@ -537,7 +542,7 @@ impl Actor {
             }
             let lib = Arc::new(lib);
             *shared.library.write().unwrap_or_else(|e| e.into_inner()) = lib.clone();
-            shared.emit(Event::Library(lib.infos()));
+            shared.emit(Event::Library(lib.files().to_vec()));
             if shared.connected() {
                 shared.send(msg::UNSHARE_ALL, "");
                 share_all(&shared, &lib);

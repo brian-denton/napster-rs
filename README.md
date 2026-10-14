@@ -5,10 +5,12 @@ that makes it work again. The protocol was recovered from the original
 `napster.exe`; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 The desktop client recreates the look of the 2001 client: Windows 2000
-gray, bevelled buttons, the tab row, and the Search and Transfer windows.
+gray, bevelled buttons, the tab row, the Search and Transfer windows, and
+the Library with its built-in player.
 
 ![Search](docs/screenshots/search.png)
-![Transfer](docs/screenshots/transfer.png)
+![Transfer: two downloads sharing a 56K user's 3.5 KB/s upload](docs/screenshots/transfer.png)
+![Library and the built-in player](docs/screenshots/player.png)
 ![Chat](docs/screenshots/chat.png)
 
 | Crate | Binary | What it is |
@@ -348,6 +350,10 @@ this set, it:
 NAPSTER_SNAPSHOT_DIR=shots napster --config test-user.json
 ```
 
+Add `NAPSTER_SNAPSHOT_PLAY=1` to start the player before the Library shot
+is taken. Only use it with silent test files: playback goes through your
+speakers.
+
 ## Security
 
 The original Napster protocol had no security at all. Here's what
@@ -379,6 +385,14 @@ napster-rs adds, and what it can't fix.
 
 * **Shared files only:** peers can only fetch files you share, by their
   exact names. Nothing else on your disk is reachable.
+* **Private folder paths:** your files are listed as
+  `<shared folder>\Artist\Song.mp3`, never by full path. Others can't learn
+  your Windows user name or folder layout. (The 2001 client sent full
+  paths; when browsing such a user, napster-rs shows only the file name.)
+* **Verified browsing:** a direct browse checks that the program it
+  reached really belongs to the user you asked for. Without this, two
+  clients sharing a data port on one computer could show your own files
+  as theirs.
 * **Audio only:** the client refuses to download anything that isn't an
   audio file, so a `song.mp3.exe` never arrives. **Open** only plays audio
   files; anything else is shown in its folder, never run.

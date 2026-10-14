@@ -70,6 +70,9 @@ pub enum Phase {
 pub struct Snapshots {
     pub dir: PathBuf,
     pub search: String,
+    /// `NAPSTER_SNAPSHOT_PLAY=1`: start the player so the Library shot shows
+    /// a song playing. Off by default so screenshots never make noise.
+    pub play: bool,
     pub phase: Phase,
     pub since: Instant,
 }
@@ -81,6 +84,7 @@ impl Snapshots {
         Some(Self {
             dir,
             search: std::env::var("NAPSTER_SNAPSHOT_SEARCH").unwrap_or_else(|_| "mp3".into()),
+            play: std::env::var("NAPSTER_SNAPSHOT_PLAY").is_ok_and(|v| v == "1"),
             phase: Phase::Starting,
             since: Instant::now(),
         })

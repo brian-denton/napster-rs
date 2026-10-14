@@ -12,7 +12,7 @@ use egui_extras::{Column, TableBuilder};
 use napster_core::{
     ChannelUser, Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState,
 };
-use napster_proto::{link_speed_name, Compare, FileInfo, SearchQuery, SearchResult, LINK_SPEEDS};
+use napster_proto::{link_speed_name, Compare, SearchQuery, SearchResult, LINK_SPEEDS};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::classic::{self, bold, commas};
@@ -71,6 +71,8 @@ struct ChatView {
     title: String,
     topic: String,
     users: Vec<ChannelUser>,
+    /// The user last clicked in the member list (highlighted).
+    selected_user: Option<String>,
     lines: Vec<Line>,
     input: String,
     unread: bool,
@@ -82,6 +84,7 @@ impl ChatView {
             title: title.into(),
             topic: String::new(),
             users: vec![],
+            selected_user: None,
             lines: vec![],
             input: String::new(),
             unread: false,
@@ -156,7 +159,8 @@ pub struct App {
     tab: Tab,
     console: Vec<Line>,
     console_input: String,
-    library: Vec<FileInfo>,
+    /// Our shared files (`info.filename` is what others see).
+    library: Vec<napster_core::library::SharedFile>,
     library_selected: Option<usize>,
     scanning: Option<(usize, usize)>,
     search: SearchView,
@@ -986,6 +990,7 @@ impl App {
         }
         let is_channel = matches!(key, ChatKey::Channel(_));
         let action: RefCell<Option<Act>> = RefCell::new(None);
+        let picked: RefCell<Option<String>> = RefCell::new(None);
         let total_w = ui.available_width();
         let users_w = if is_channel { 190.0 } else { 0.0 };
         let text_w = if is_channel { total_w - users_w - 6.0 } else { total_w };
@@ -1018,15 +1023,31 @@ impl App {
                         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             for u in &v.users {
-                                let r = ui
-                                    .add(
-                                        egui::Label::new(u.nick.as_str()).sense(egui::Sense::click()).selectable(false),
-                                    )
-                                    .on_hover_text(format!(
-                                        "{} — sharing {} files",
-                                        link_speed_name(u.link_speed),
-                                        u.shared
-                                    ));
+                                let selected =
+                                    v.selected_user.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&u.nick));
+                                let (rect, r) =
+                                    ui.allocate_exact_size(vec2(ui.available_width(), 17.0), egui::Sense::click());
+                                let p = ui.painter();
+                                if selected {
+                                    p.rect_filled(rect, egui::CornerRadius::ZERO, classic::NAVY);
+                                } else if r.hovered() {
+                                    p.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_rgb(0xdd, 0xe6, 0xf6));
+                                }
+                                p.text(
+                                    rect.left_center() + vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &u.nick,
+                                    egui::FontId::proportional(12.0),
+                                    if selected { Color32::WHITE } else { classic::TEXT },
+                                );
+                                let r = r.on_hover_text(format!(
+                                    "{} — sharing {} files",
+                                    link_speed_name(u.link_speed),
+                                    u.shared
+                                ));
+                                if r.clicked() || r.secondary_clicked() {
+                                    *picked.borrow_mut() = Some(u.nick.clone());
+                                }
                                 if r.double_clicked() {
                                     *action.borrow_mut() = Some(Act::User(u.nick.clone(), "msg"));
                                 }
@@ -1053,6 +1074,11 @@ impl App {
                 *action.borrow_mut() = Some(Act::User(title.clone(), if is_channel { "part" } else { "close" }));
             }
         });
+        if let Some(nick) = picked.into_inner() {
+            if let Some(v) = self.chats.get_mut(&key) {
+                v.selected_user = Some(nick);
+            }
+        }
         if let Some(text) = submitted {
             self.submit(Some(key), text);
         }
@@ -1090,7 +1116,7 @@ impl App {
                     files.len(),
                     |i| selected == Some(i),
                     |ui, i, c, sel| {
-                        let f = &files[i];
+                        let f = &files[i].info;
                         let t = match c {
                             0 => f.filename.clone(),
                             1 => commas(f.size),
@@ -1101,7 +1127,7 @@ impl App {
                     },
                     Some(&mut menu),
                 );
-                if let Some(i) = out.clicked {
+                if let Some(i) = out.clicked.or(out.secondary) {
                     self.library_selected = Some(i);
                 }
                 if let Some(i) = out.double {
@@ -1144,7 +1170,7 @@ impl App {
                     },
                     Some(&mut menu),
                 );
-                if let Some(i) = out.clicked {
+                if let Some(i) = out.clicked.or(out.secondary) {
                     self.player.selected = Some(i);
                 }
                 if let Some(i) = out.double {
@@ -1160,7 +1186,7 @@ impl App {
         });
         if let Some((i, what)) = action.into_inner() {
             if let Some(f) = self.library.get(i) {
-                let path = PathBuf::from(&f.filename);
+                let path = f.path.clone();
                 match what {
                     "play" => self.player.play_file(path),
                     "enqueue" => {
@@ -1433,6 +1459,10 @@ impl App {
             self.download(&r);
         } else if let Some(i) = out.clicked {
             toggle_select(ui, &mut self.search.selected, i);
+        } else if let Some(i) = out.secondary {
+            if !self.search.selected.contains(&i) {
+                self.search.selected = HashSet::from([i]);
+            }
         }
         let n = self.search.results.len();
         let text = if self.search.searching {
@@ -1575,7 +1605,7 @@ impl App {
                     |ui, i, c, sel| {
                         let f = &b.results[i].file;
                         let t = match c {
-                            0 => f.filename.clone(),
+                            0 => display_name(&f.filename).to_owned(),
                             1 => commas(f.size),
                             2 => dash(f.bitrate),
                             3 => dash(f.frequency),
@@ -1600,6 +1630,10 @@ impl App {
                         get.push(b.results[i].clone());
                     } else if let Some(i) = out.clicked {
                         toggle_select(ui, &mut b.selected, i);
+                    } else if let Some(i) = out.secondary {
+                        if !b.selected.contains(&i) {
+                            b.selected = HashSet::from([i]);
+                        }
                     }
                     if get_clicked {
                         get.extend(b.selected.iter().map(|&i| b.results[i].clone()));
@@ -1701,7 +1735,7 @@ impl App {
                 },
                 None,
             );
-            if let Some(i) = out.clicked {
+            if let Some(i) = out.clicked.or(out.secondary) {
                 clicked = Some(rows[i].id);
             }
             if let Some(i) = out.double {
@@ -1787,7 +1821,7 @@ impl App {
             None,
         );
         let mut join: Option<String> = None;
-        if let Some(i) = out.clicked {
+        if let Some(i) = out.clicked.or(out.secondary) {
             self.channel_selected = Some(i);
         }
         if let Some(i) = out.double {
@@ -2199,6 +2233,17 @@ impl App {
                 }
             }
             Phase::Settling => {
+                if self.player.playlist.is_empty() {
+                    for f in self.library.iter().take(3) {
+                        self.player.enqueue(f.path.clone());
+                    }
+                    if s.play && !self.player.playlist.is_empty() {
+                        self.player.play_index(0);
+                    } else {
+                        self.player.current = Some(0);
+                        self.player.selected = Some(0);
+                    }
+                }
                 if s.elapsed().as_millis() > 2500 {
                     s.go(Phase::Show(0));
                 }
@@ -2211,17 +2256,16 @@ impl App {
                 self.force_splash = false;
                 match shot {
                     Shot::Home => self.tab = Tab::Home,
-                    Shot::Chat | Shot::Whois => self.tab = Tab::Chat,
-                    Shot::Library => {
-                        self.tab = Tab::Library;
-                        if self.player.playlist.is_empty() {
-                            for f in self.library.iter().take(3) {
-                                self.player.enqueue(PathBuf::from(&f.filename));
-                            }
-                            self.player.current = Some(0);
-                            self.player.selected = Some(0);
+                    Shot::Chat | Shot::Whois => {
+                        self.tab = Tab::Chat;
+                        // show the member-list highlight on someone else
+                        let me = self.my_nick().to_lowercase();
+                        if let Some(v) = self.active_chat.clone().and_then(|k| self.chats.get_mut(&k)) {
+                            v.selected_user =
+                                v.users.iter().find(|u| u.nick.to_lowercase() != me).map(|u| u.nick.clone());
                         }
                     }
+                    Shot::Library => self.tab = Tab::Library,
                     Shot::Search => self.tab = Tab::Search,
                     Shot::HotList => self.tab = Tab::HotList,
                     Shot::Transfer => {
@@ -2329,6 +2373,9 @@ type RowMenu<'a> = &'a mut dyn FnMut(&mut Ui, usize);
 
 struct ListOut {
     clicked: Option<usize>,
+    /// Right-clicked (its context menu is opening); callers select it so
+    /// it's clear which row the menu acts on.
+    secondary: Option<usize>,
     double: Option<usize>,
     header: Option<usize>,
 }
@@ -2346,7 +2393,7 @@ fn list_view(
     mut cell: impl FnMut(&mut Ui, usize, usize, bool),
     mut menu: Option<RowMenu<'_>>,
 ) -> ListOut {
-    let mut out = ListOut { clicked: None, double: None, header: None };
+    let mut out = ListOut { clicked: None, secondary: None, double: None, header: None };
     let width = ui.available_width();
     let height = height.max(60.0);
     classic::sunken(ui, vec2(width, height), Color32::WHITE, |ui| {
@@ -2387,6 +2434,8 @@ fn list_view(
                         out.double = Some(i);
                     } else if r.clicked() {
                         out.clicked = Some(i);
+                    } else if r.secondary_clicked() {
+                        out.secondary = Some(i);
                     }
                     if let Some(m) = menu.as_mut() {
                         r.context_menu(|ui| m(ui, i));
@@ -2399,6 +2448,8 @@ fn list_view(
 }
 
 fn user_menu(ui: &mut Ui, nick: &str, action: &RefCell<Option<Act>>) {
+    ui.label(bold(nick));
+    ui.separator();
     for (label, what) in [
         ("Instant Message", "msg"),
         ("Browse User's Files", "browse"),
@@ -2482,6 +2533,19 @@ fn line_ui(ui: &mut Ui, l: &Line) {
         }
         ui.label(RichText::new(&l.text).color(l.color));
     });
+}
+
+/// How to show a file name from another user. napster-rs clients send
+/// `Folder\\Song.mp3`, but older clients send full paths like
+/// `C:\\Users\\...\\Song.mp3`; show just the file name for those.
+fn display_name(name: &str) -> &str {
+    let b = name.as_bytes();
+    let absolute = name.starts_with(['/', '\\']) || (b.len() > 2 && b[1] == b':' && b[0].is_ascii_alphabetic());
+    if absolute {
+        napster_proto::share::basename(name)
+    } else {
+        name
+    }
 }
 
 fn status_label(t: &TransferInfo) -> String {
@@ -2597,3 +2661,13 @@ const HELP: &[(&str, &str)] = &[
          cannot transfer files with each other.",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hides_absolute_paths() {
+        assert_eq!(super::display_name("Music\\Band\\Song.mp3"), "Music\\Band\\Song.mp3");
+        assert_eq!(super::display_name("C:\\Users\\bob\\Music\\Song.mp3"), "Song.mp3");
+        assert_eq!(super::display_name("/home/bob/Song.mp3"), "Song.mp3");
+    }
+}

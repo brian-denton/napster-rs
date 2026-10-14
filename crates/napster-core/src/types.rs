@@ -177,7 +177,8 @@ pub enum Event {
         done: usize,
         total: usize,
     },
-    Library(Vec<FileInfo>),
+    /// Our shared files; `info.filename` is what others see, `path` is local.
+    Library(Vec<crate::library::SharedFile>),
     SearchResult(SearchResult),
     SearchEnd,
     BrowseResult(SearchResult),

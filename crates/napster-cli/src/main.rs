@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use napster_core::{Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState};
-use napster_proto::{link_speed_name, FileInfo, SearchQuery, SearchResult};
+use napster_proto::{link_speed_name, SearchQuery, SearchResult};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -90,7 +90,7 @@ struct Ui {
     results: Vec<SearchResult>,
     room: Option<String>,
     transfers: BTreeMap<u64, TransferInfo>,
-    files: Vec<FileInfo>,
+    files: Vec<napster_core::library::SharedFile>,
     /// /update was typed: install whatever the check finds
     install_when_found: bool,
 }
@@ -273,7 +273,7 @@ impl Ui {
             "rescan" => c.send(Command::Rescan),
             "files" => {
                 for f in &self.files {
-                    println!("  {}  [{} kbps, {}]", f.filename, f.bitrate, size(f.size));
+                    println!("  {}  [{} kbps, {}]", f.info.filename, f.info.bitrate, size(f.info.size));
                 }
                 println!("--- {} files shared", self.files.len());
             }

@@ -133,7 +133,7 @@ impl Player {
         }
         let handle = &self.output.as_ref().unwrap().1;
         let sink = Sink::try_new(handle)?;
-        let decoder = Decoder::new(BufReader::new(File::open(path)?))?;
+        let decoder = Decoder::new(skip_id3(File::open(path)?)?)?;
         self.decoded_len = decoder.total_duration();
         sink.set_volume(self.volume);
         sink.append(decoder);
@@ -269,6 +269,45 @@ impl Player {
     }
 }
 
+/// Open `file` positioned after any ID3v2 tag. The decoder chokes on some
+/// tags (an empty one, for instance) and we don't use their metadata.
+fn skip_id3(mut file: File) -> std::io::Result<Offset<BufReader<File>>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut head = [0u8; 10];
+    let n = file.read(&mut head)?;
+    let base = napster_core::mp3::id3v2_len(&head[..n]) as u64;
+    let mut inner = BufReader::new(file);
+    inner.seek(SeekFrom::Start(base))?;
+    Ok(Offset { inner, base })
+}
+
+/// A reader whose position 0 is `base` bytes into the underlying one.
+struct Offset<R> {
+    inner: R,
+    base: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Offset<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for Offset<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let at = match pos {
+            SeekFrom::Start(n) => self.inner.seek(SeekFrom::Start(self.base + n))?,
+            other => self.inner.seek(other)?,
+        };
+        if at < self.base {
+            self.inner.seek(SeekFrom::Start(self.base))?;
+            return Ok(0);
+        }
+        Ok(at - self.base)
+    }
+}
+
 fn resolve(entry: &str, base: &Path) -> PathBuf {
     let p = PathBuf::from(entry.trim());
     if p.is_absolute() {
@@ -350,6 +389,19 @@ mod tests {
         assert_eq!(t.title, "tone");
         assert_eq!(t.seconds, 5);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decodes_mp3_with_id3_tag() {
+        let dir = std::env::temp_dir().join(format!("napster-player-id3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tagged.mp3");
+        let mut data = b"ID3      ".to_vec();
+        data.extend(napster_core::mp3::synth_mp3(200, 9));
+        std::fs::write(&path, data).unwrap();
+        let decoder = Decoder::new(skip_id3(File::open(&path).unwrap()).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(decoder.is_ok(), "{:?}", decoder.err());
     }
 
     #[test]

@@ -444,7 +444,14 @@ pub(crate) async fn fetch_list(shared: Arc<Shared>, nick: String, addr: SocketAd
         peer::expect_ack(&mut stream).await?;
         stream.write_all(peer::GETLIST).await?;
         stream.flush().await?;
-        let (_, files) = peer::read_list(&mut stream, Vec::new(), true).await?;
+        let (who, files) = peer::read_list(&mut stream, Vec::new(), true).await?;
+        // The list starts with the browsee's nick. If it's someone else
+        // (two clients on one computer sharing a data port, say), we
+        // reached the wrong program: don't show its files as theirs.
+        let who = who.unwrap_or_default();
+        if !who.eq_ignore_ascii_case(&nick) {
+            anyhow::bail!("reached {who:?} instead of {nick} at {addr}");
+        }
         lock(&shared.pending_browses).remove(&nick.to_lowercase());
         let ip = match addr.ip() {
             std::net::IpAddr::V4(v4) => Some(v4),

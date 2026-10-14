@@ -171,6 +171,11 @@ async fn search_and_download() {
     assert_eq!(results.len(), 1, "{results:?}");
     let r = &results[0];
     assert_eq!(r.nick, "alice");
+    // others see the shared folder's name and the path inside it, never
+    // where it lives on alice's disk
+    assert_eq!(r.file.filename, r"shared\Generic Band - Generic Song.mp3");
+    let alice_root = alice.shared.parent().unwrap().to_string_lossy().into_owned();
+    assert!(!r.file.filename.contains(&alice_root), "{}", r.file.filename);
     assert_eq!(r.file.bitrate, 128);
     assert_eq!(r.file.frequency, 44100);
     assert!(bob.search("nothing matches this").await.is_empty());
@@ -382,4 +387,16 @@ async fn authentic_speeds_follow_line_speed() {
     assert_same(&saved, &data);
     // 8.3 KB at 3.6 KB/s is ~2.3 s
     assert!(secs > 1.6 && secs < 10.0, "took {secs:.2}s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browsing_yourself_is_refused() {
+    let (server, _) = start_server().await;
+    let mut alice = Peer::new("alice", server, false).await;
+    alice.share("mine.mp3", &song(50));
+    alice.rescan(1).await;
+    alice.connect().await;
+    alice.client.send(Command::Browse("Alice".into()));
+    let err = alice.wait(|e| if let Event::Error(e) = e { Some(e.clone()) } else { None }).await;
+    assert!(err.contains("That's you"), "{err}");
 }
