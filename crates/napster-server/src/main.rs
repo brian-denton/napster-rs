@@ -54,14 +54,25 @@ struct Args {
     /// Files each user may share.
     #[arg(long, default_value_t = 20_000)]
     max_shares: usize,
+    /// This server's unique name on a linked network.
+    #[arg(long, default_value = "napd")]
+    server_name: String,
+    /// Accept links from other napd servers here (e.g. 0.0.0.0:8890).
+    #[arg(long)]
+    link_listen: Option<SocketAddr>,
+    /// Link to another server: host:port=FINGERPRINT (repeatable). The
+    /// fingerprint is the one that server prints at startup.
+    #[arg(long = "link")]
+    links: Vec<napster_server::link::LinkPeer>,
+    /// Shared secret every linked server uses.
+    #[arg(long, env = "NAPD_LINK_PASSWORD", hide_env_values = true)]
+    link_password: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
     let mut config = Config {
@@ -76,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
         tls_key: args.tls_key,
         max_conns_per_ip: args.max_conns_per_ip,
         max_shares: args.max_shares,
+        server_name: args.server_name,
+        link_listen: args.link_listen,
+        links: args.links,
+        link_password: args.link_password,
         ..Config::default()
     };
     if let Some(path) = args.motd {

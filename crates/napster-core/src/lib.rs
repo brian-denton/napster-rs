@@ -8,6 +8,7 @@ pub mod config;
 mod engine;
 pub mod library;
 pub mod mp3;
+pub mod proxy;
 mod throttle;
 pub mod tls;
 mod transfer;
@@ -27,8 +28,9 @@ pub const AUDIO_EXTENSIONS: [&str; 9] = ["mp3", "mp2", "mp1", "wma", "ogg", "fla
 /// Is `name` an audio file by its (last) extension?
 pub fn is_audio_file(name: &str) -> bool {
     let base = napster_proto::share::basename(name);
-    base.rsplit_once('.')
-        .is_some_and(|(stem, ext)| !stem.is_empty() && AUDIO_EXTENSIONS.iter().any(|a| a.eq_ignore_ascii_case(ext.trim())))
+    base.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && AUDIO_EXTENSIONS.iter().any(|a| a.eq_ignore_ascii_case(ext.trim()))
+    })
 }
 
 /// Client string sent in the login message.
@@ -49,7 +51,17 @@ mod tests {
     #[test]
     fn local_addresses() {
         use crate::engine::is_local_ip;
-        for ip in ["127.0.0.1", "10.1.2.3", "192.168.0.5", "172.16.9.9", "169.254.1.1", "100.64.0.1", "::1", "fd00::1", "fe80::1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.5",
+            "172.16.9.9",
+            "169.254.1.1",
+            "100.64.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
             assert!(is_local_ip(ip.parse().unwrap()), "{ip}");
         }
         for ip in ["8.8.8.8", "205.188.1.1", "2001:4860::8888"] {
@@ -57,4 +69,3 @@ mod tests {
         }
     }
 }
-

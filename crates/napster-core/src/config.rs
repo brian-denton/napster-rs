@@ -50,6 +50,8 @@ pub struct ClientConfig {
     /// config file, `known_servers.json`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub known_servers: Option<PathBuf>,
+    /// SOCKS5 proxy for the server connection (and optionally transfers).
+    pub proxy: crate::proxy::ProxyConfig,
 }
 
 /// Typical sustained throughput in KB/s (download, upload) for each link
@@ -72,10 +74,8 @@ pub const PERIOD_RATES: [(f32, f32); 11] = [
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        let download_dir = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Napster");
+        let download_dir =
+            dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("Napster");
         let shared_dirs = dirs::audio_dir().into_iter().collect();
         Self {
             nick: String::new(),
@@ -101,6 +101,7 @@ impl Default for ClientConfig {
             check_for_updates: true,
             tls: false,
             known_servers: None,
+            proxy: crate::proxy::ProxyConfig::default(),
         }
     }
 }
@@ -109,6 +110,11 @@ impl ClientConfig {
     /// Directory where partial downloads live until complete.
     pub fn incomplete_dir(&self) -> PathBuf {
         self.download_dir.join("Incomplete")
+    }
+
+    /// The proxy, if one is turned on.
+    pub fn active_proxy(&self) -> Option<&crate::proxy::ProxyConfig> {
+        self.proxy.enabled.then_some(&self.proxy)
     }
 
     /// Effective (download, upload) caps in bytes per second; 0 = none.

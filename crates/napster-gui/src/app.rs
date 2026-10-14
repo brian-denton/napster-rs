@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use eframe::egui::{self, vec2, Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
-use napster_core::{ChannelUser, Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState};
+use napster_core::{
+    ChannelUser, Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState,
+};
 use napster_proto::{link_speed_name, Compare, FileInfo, SearchQuery, SearchResult, LINK_SPEEDS};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -76,7 +78,14 @@ struct ChatView {
 
 impl ChatView {
     fn new(title: &str) -> Self {
-        Self { title: title.into(), topic: String::new(), users: vec![], lines: vec![], input: String::new(), unread: false }
+        Self {
+            title: title.into(),
+            topic: String::new(),
+            users: vec![],
+            lines: vec![],
+            input: String::new(),
+            unread: false,
+        }
     }
     fn push(&mut self, l: Line) {
         self.lines.push(l);
@@ -168,6 +177,7 @@ pub struct App {
     whois: Option<Vec<(String, String)>>,
     prefs: Option<ClientConfig>,
     force_splash: bool,
+    player: crate::player::Player,
     update: Option<UpdateStep>,
     snap: Option<Snapshots>,
     snap_whois: Option<Vec<(String, String)>>,
@@ -178,7 +188,8 @@ impl App {
         classic::install(&cc.egui_ctx);
         let config = ClientConfig::load(&config_path).unwrap_or_default();
         let ctx = cc.egui_ctx.clone();
-        let (client, events) = napster_core::Client::start(config.clone(), Some(Arc::new(move || ctx.request_repaint())));
+        let (client, events) =
+            napster_core::Client::start(config.clone(), Some(Arc::new(move || ctx.request_repaint())));
         let hotlist = config.hotlist.iter().map(|n| (n.to_lowercase(), (n.clone(), None))).collect();
         let first_run = config.nick.is_empty();
         let mut app = Self {
@@ -222,6 +233,7 @@ impl App {
             whois: None,
             prefs: None,
             force_splash: false,
+            player: crate::player::Player::default(),
             update: None,
             snap: Snapshots::from_env(),
             snap_whois: None,
@@ -539,7 +551,8 @@ impl App {
     }
 
     fn browse(&mut self, nick: &str) {
-        self.browse = Some(BrowseView { nick: nick.to_owned(), results: vec![], done: false, selected: HashSet::new() });
+        self.browse =
+            Some(BrowseView { nick: nick.to_owned(), results: vec![], done: false, selected: HashSet::new() });
         self.client.send(Command::Browse(nick.to_owned()));
         self.tab = Tab::HotList;
         self.hotlist_selected = Some(nick.to_lowercase());
@@ -767,7 +780,12 @@ impl App {
 
     fn tab_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("tabs")
-            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 4 }))
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: 6,
+                bottom: 4,
+            }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -1001,8 +1019,14 @@ impl App {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             for u in &v.users {
                                 let r = ui
-                                    .add(egui::Label::new(u.nick.as_str()).sense(egui::Sense::click()).selectable(false))
-                                    .on_hover_text(format!("{} — sharing {} files", link_speed_name(u.link_speed), u.shared));
+                                    .add(
+                                        egui::Label::new(u.nick.as_str()).sense(egui::Sense::click()).selectable(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} — sharing {} files",
+                                        link_speed_name(u.link_speed),
+                                        u.shared
+                                    ));
                                 if r.double_clicked() {
                                     *action.borrow_mut() = Some(Act::User(u.nick.clone(), "msg"));
                                 }
@@ -1038,34 +1062,113 @@ impl App {
     }
 
     fn library_tab(&mut self, ui: &mut Ui) {
-        let files = &self.library;
-        let h = ui.available_height() - 58.0;
-        let selected = self.library_selected;
-        let out = list_view(
-            ui,
-            "library",
-            h,
-            &[("Filename", 0.0), ("Filesize", 90.0), ("Bitrate", 55.0), ("Freq", 60.0), ("Length", 55.0)],
-            files.len(),
-            |i| selected == Some(i),
-            |ui, i, c, sel| {
-                let f = &files[i];
-                let t = match c {
-                    0 => f.filename.clone(),
-                    1 => commas(f.size),
-                    2 => dash(f.bitrate),
-                    3 => dash(f.frequency),
-                    _ => duration(f.seconds),
+        let action: RefCell<Option<(usize, &'static str)>> = RefCell::new(None);
+        let list_h = ui.available_height() - 104.0;
+        let total_w = ui.available_width();
+        let playlist_w = (total_w * 0.32).clamp(200.0, 340.0);
+        ui.horizontal_top(|ui| {
+            // ---- My Files
+            ui.vertical(|ui| {
+                ui.set_width(total_w - playlist_w - 6.0);
+                let files = &self.library;
+                let selected = self.library_selected;
+                let mut menu = |ui: &mut Ui, i: usize| {
+                    for (label, what) in
+                        [("Play", "play"), ("Add to Playlist", "enqueue"), ("Show in Folder", "reveal")]
+                    {
+                        if ui.button(label).clicked() {
+                            *action.borrow_mut() = Some((i, what));
+                            ui.close_menu();
+                        }
+                    }
                 };
-                classic::cell(ui, t, sel);
-            },
-            None,
-        );
-        if let Some(i) = out.clicked {
-            self.library_selected = Some(i);
-        }
-        if let Some(i) = out.double {
-            open_path(&PathBuf::from(&self.library[i].filename));
+                let out = list_view(
+                    ui,
+                    "library",
+                    list_h,
+                    &[("Filename", 0.0), ("Filesize", 80.0), ("Bitrate", 50.0), ("Length", 50.0)],
+                    files.len(),
+                    |i| selected == Some(i),
+                    |ui, i, c, sel| {
+                        let f = &files[i];
+                        let t = match c {
+                            0 => f.filename.clone(),
+                            1 => commas(f.size),
+                            2 => dash(f.bitrate),
+                            _ => duration(f.seconds),
+                        };
+                        classic::cell(ui, t, sel);
+                    },
+                    Some(&mut menu),
+                );
+                if let Some(i) = out.clicked {
+                    self.library_selected = Some(i);
+                }
+                if let Some(i) = out.double {
+                    *action.borrow_mut() = Some((i, "play"));
+                }
+            });
+            // ---- Playlist
+            ui.vertical(|ui| {
+                let tracks = &self.player.playlist;
+                let (cur, sel) = (self.player.current, self.player.selected);
+                let mut pl_action: Option<(usize, &'static str)> = None;
+                let mut menu = |ui: &mut Ui, i: usize| {
+                    if ui.button("Play").clicked() {
+                        pl_action = Some((i, "pl-play"));
+                        ui.close_menu();
+                    }
+                    if ui.button("Remove from Playlist").clicked() {
+                        pl_action = Some((i, "pl-remove"));
+                        ui.close_menu();
+                    }
+                    if ui.button("Clear Playlist").clicked() {
+                        pl_action = Some((i, "pl-clear"));
+                        ui.close_menu();
+                    }
+                };
+                let out = list_view(
+                    ui,
+                    "playlist",
+                    list_h,
+                    &[("Playlist", 0.0), ("Time", 44.0)],
+                    tracks.len(),
+                    |i| sel == Some(i),
+                    |ui, i, c, s| {
+                        let t = &tracks[i];
+                        let text = match c {
+                            0 => format!("{}{}", if cur == Some(i) { "► " } else { "" }, t.title),
+                            _ => duration(t.seconds),
+                        };
+                        classic::cell(ui, text, s);
+                    },
+                    Some(&mut menu),
+                );
+                if let Some(i) = out.clicked {
+                    self.player.selected = Some(i);
+                }
+                if let Some(i) = out.double {
+                    pl_action = Some((i, "pl-play"));
+                }
+                match pl_action {
+                    Some((i, "pl-play")) => self.player.play_index(i),
+                    Some((i, "pl-remove")) => self.player.remove(i),
+                    Some((_, "pl-clear")) => self.player.clear(),
+                    _ => {}
+                }
+            });
+        });
+        if let Some((i, what)) = action.into_inner() {
+            if let Some(f) = self.library.get(i) {
+                let path = PathBuf::from(&f.filename);
+                match what {
+                    "play" => self.player.play_file(path),
+                    "enqueue" => {
+                        self.player.enqueue(path);
+                    }
+                    _ => reveal(&path),
+                }
+            }
         }
         let text = match self.scanning {
             Some((d, t)) => format!("Building My Files... {d} of {t}"),
@@ -1074,8 +1177,10 @@ impl App {
         };
         classic::info_bar(ui, &text);
         ui.add_space(3.0);
+        self.player_bar(ui);
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 12.0) / 3.0;
+            let w = (ui.available_width() - 4.0 * 6.0) / 5.0;
             if classic::button(ui, "Rescan My Files", Some(w)).clicked() {
                 self.client.send(Command::Rescan);
             }
@@ -1085,6 +1190,83 @@ impl App {
             if classic::button(ui, "Open Save Directory", Some(w)).clicked() {
                 open_path(&self.config.download_dir);
             }
+            if classic::button(ui, "Load Playlist...", Some(w)).clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("M3U and PLS Playlists", &["m3u", "pls"]).pick_file()
+                {
+                    if let Err(e) = self.player.load_playlist(&p) {
+                        self.log(Line::err(format!("Unable to open specified playlist {}! ({e})", p.display())));
+                    }
+                }
+            }
+            if classic::button(ui, "Save Playlist...", Some(w)).clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("M3U Playlist", &["m3u"])
+                    .add_filter("PLS Playlist", &["pls"])
+                    .set_file_name("playlist.m3u")
+                    .save_file()
+                {
+                    if let Err(e) = self.player.save_playlist(&p) {
+                        self.log(Line::err(format!("Unable to save specified playlist {}! ({e})", p.display())));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Transport buttons, LCD display, seek and volume.
+    fn player_bar(&mut self, ui: &mut Ui) {
+        use crate::player::State;
+        use classic::Media;
+        let state = self.player.state();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if classic::media_button(ui, Media::Prev, false).on_hover_text("Previous").clicked() {
+                self.player.prev();
+            }
+            if classic::media_button(ui, Media::Play, state == State::Playing).on_hover_text("Play").clicked() {
+                self.player.play();
+            }
+            if classic::media_button(ui, Media::Pause, state == State::Paused).on_hover_text("Pause").clicked() {
+                self.player.pause();
+            }
+            if classic::media_button(ui, Media::Stop, false).on_hover_text("Stop").clicked() {
+                self.player.stop();
+            }
+            if classic::media_button(ui, Media::Next, false).on_hover_text("Next").clicked() {
+                self.player.next();
+            }
+            ui.add_space(8.0);
+            let pos = self.player.position().as_secs();
+            let len = self.player.length().as_secs();
+            let title = match (self.player.current_track(), &self.player.error) {
+                (_, Some(e)) => e.clone(),
+                (Some(t), None) => t.title.clone(),
+                (None, None) => "No song loaded".into(),
+            };
+            let status = match state {
+                State::Playing => "PLAY",
+                State::Paused => "PAUSE",
+                State::Stopped => "STOP",
+            };
+            let line2 = format!("{status}  {}  /  {}", hms(pos), hms(len));
+            let lcd_w = (ui.available_width() - 280.0).max(180.0);
+            classic::lcd(ui, (&title, &line2), lcd_w);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().slider_width = 150.0;
+                let mut at = pos as f32;
+                let r = ui.add_enabled(
+                    len > 0 && state != State::Stopped,
+                    egui::Slider::new(&mut at, 0.0..=len.max(1) as f32).show_value(false).text("Seek"),
+                );
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    self.player.seek(std::time::Duration::from_secs_f32(at));
+                }
+                let mut vol = self.player.volume();
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false).text("Volume")).changed() {
+                    self.player.set_volume(vol);
+                }
+            });
         });
     }
 
@@ -1137,7 +1319,9 @@ impl App {
                             format!("{v} KB/S")
                         });
                         let freqs = [8000, 11025, 16000, 22050, 32000, 44100, 48000];
-                        compare_row(ui, "Frequency must be:", "fq", &mut self.search.freq, cw, &freqs, |v| format!("{v} HZ"));
+                        compare_row(ui, "Frequency must be:", "fq", &mut self.search.freq, cw, &freqs, |v| {
+                            format!("{v} HZ")
+                        });
                         let speeds: Vec<u32> = (0..=10).collect();
                         compare_row(ui, "Line Speed must be:", "ls", &mut self.search.speed, cw, &speeds, |v| {
                             link_speed_name(v).to_owned()
@@ -1176,7 +1360,15 @@ impl App {
         .iter()
         .enumerate()
         .map(|(i, (t, w))| {
-            let arrow = if i < SORT_COLS.len() && SORT_COLS[i] == sort.0 { if sort.1 { " ▲" } else { " ▼" } } else { "" };
+            let arrow = if i < SORT_COLS.len() && SORT_COLS[i] == sort.0 {
+                if sort.1 {
+                    " ▲"
+                } else {
+                    " ▼"
+                }
+            } else {
+                ""
+            };
             (format!("{t}{arrow}"), *w)
         })
         .collect();
@@ -1256,14 +1448,16 @@ impl App {
             let w = (ui.available_width() - 6.0) / 2.0;
             let any = !self.search.selected.is_empty();
             if classic::button_ex(ui, "Get Selected Song(s)", Some(w), any, false).clicked() {
-                let picks: Vec<SearchResult> = self.search.selected.iter().map(|&i| self.search.results[i].clone()).collect();
+                let picks: Vec<SearchResult> =
+                    self.search.selected.iter().map(|&i| self.search.results[i].clone()).collect();
                 for r in picks {
                     self.download(&r);
                 }
                 self.search.selected.clear();
             }
             if classic::button_ex(ui, "Add Selected User to Hot List", Some(w), any, false).clicked() {
-                let nicks: HashSet<String> = self.search.selected.iter().map(|&i| self.search.results[i].nick.clone()).collect();
+                let nicks: HashSet<String> =
+                    self.search.selected.iter().map(|&i| self.search.results[i].nick.clone()).collect();
                 for n in nicks {
                     self.hotlist_add(&n);
                 }
@@ -1290,15 +1484,24 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         for (key, (nick, online)) in &self.hotlist {
                             let sel = selected.as_ref() == Some(key);
-                            let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), egui::Sense::click());
+                            let (rect, r) =
+                                ui.allocate_exact_size(vec2(ui.available_width(), 17.0), egui::Sense::click());
                             if sel {
                                 ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, classic::NAVY);
                             }
                             let color = if sel { Color32::WHITE } else { classic::TEXT };
-                            let dc = if online.is_some() { Color32::from_rgb(0x00, 0xb0, 0x00) } else { Color32::from_gray(0xb0) };
+                            let dc = if online.is_some() {
+                                Color32::from_rgb(0x00, 0xb0, 0x00)
+                            } else {
+                                Color32::from_gray(0xb0)
+                            };
                             let p = ui.painter();
                             p.circle_filled(rect.left_center() + vec2(8.0, 0.0), 4.0, dc);
-                            p.circle_stroke(rect.left_center() + vec2(8.0, 0.0), 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(60)));
+                            p.circle_stroke(
+                                rect.left_center() + vec2(8.0, 0.0),
+                                4.0,
+                                egui::Stroke::new(1.0_f32, Color32::from_gray(60)),
+                            );
                             let label = match online {
                                 Some(s) => format!("{nick} ({})", link_speed_name(*s)),
                                 None => nick.clone(),
@@ -1472,8 +1675,14 @@ impl App {
                             classic::cell(ui, sp, s);
                         }
                         5 => {
-                            if matches!(t.state, TransferState::Transferring | TransferState::Complete) || t.transferred > 0 {
-                                let color = if t.direction == Direction::Download { classic::BAR_BLUE } else { classic::BAR_YELLOW };
+                            if matches!(t.state, TransferState::Transferring | TransferState::Complete)
+                                || t.transferred > 0
+                            {
+                                let color = if t.direction == Direction::Download {
+                                    classic::BAR_BLUE
+                                } else {
+                                    classic::BAR_YELLOW
+                                };
                                 classic::progress(ui, t.progress(), color, 96.0);
                             }
                         }
@@ -1504,9 +1713,14 @@ impl App {
             self.selected_transfer = clicked;
         }
         if let Some(p) = opened {
-            open_path(&p);
+            if napster_core::is_audio_file(&p.to_string_lossy()) {
+                self.player.play_file(p);
+            } else {
+                reveal(&p);
+            }
         }
-        let active = |d: Direction| self.transfers.values().filter(|t| t.direction == d && !t.state.is_finished()).count();
+        let active =
+            |d: Direction| self.transfers.values().filter(|t| t.direction == d && !t.state.is_finished()).count();
         classic::info_bar(
             ui,
             &format!(
@@ -1521,10 +1735,8 @@ impl App {
             if classic::button(ui, "Clear Finished", Some(w)).clicked() {
                 self.client.send(Command::ClearFinished);
             }
-            let can_cancel = self
-                .selected_transfer
-                .and_then(|id| self.transfers.get(&id))
-                .is_some_and(|t| !t.state.is_finished());
+            let can_cancel =
+                self.selected_transfer.and_then(|id| self.transfers.get(&id)).is_some_and(|t| !t.state.is_finished());
             if classic::button_ex(ui, "Cancel", Some(w), can_cancel, false).clicked() {
                 if let Some(id) = self.selected_transfer {
                     self.client.send(Command::CancelTransfer(id));
@@ -1557,7 +1769,11 @@ impl App {
                 let (name, users, topic) = &rows[i];
                 match c {
                     0 => {
-                        let t = if joined.contains(&name.to_lowercase()) { format!("{name}  (joined)") } else { name.clone() };
+                        let t = if joined.contains(&name.to_lowercase()) {
+                            format!("{name}  (joined)")
+                        } else {
+                            name.clone()
+                        };
                         classic::cell(ui, t, s);
                     }
                     1 => {
@@ -1612,7 +1828,10 @@ impl App {
                         ui.set_max_width(w - 40.0);
                         classic::wordmark(ui, 46.0, false);
                         ui.add_space(6.0);
-                        ui.label(bold(format!("{} — a Rust rebuild of Napster v2.0 BETA 10", napster_core::CLIENT_INFO)));
+                        ui.label(bold(format!(
+                            "{} — a Rust rebuild of Napster v2.0 BETA 10",
+                            napster_core::CLIENT_INFO
+                        )));
                         ui.add_space(10.0);
                         for (title, body) in HELP {
                             ui.label(bold(*title));
@@ -1626,7 +1845,9 @@ impl App {
     }
 
     fn whois_window(&mut self, ctx: &egui::Context) {
-        let Some(fields) = self.whois.clone() else { return };
+        let Some(fields) = self.whois.clone() else {
+            return;
+        };
         let nick = fields.first().map(|(_, v)| v.clone()).unwrap_or_default();
         let mut open = true;
         let mut close = false;
@@ -1651,145 +1872,181 @@ impl App {
     }
 
     fn prefs_window(&mut self, ctx: &egui::Context) {
-        let Some(mut draft) = self.prefs.take() else { return };
+        let Some(mut draft) = self.prefs.take() else {
+            return;
+        };
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
         classic::dialog(ctx, "prefs", "Napster Preferences", &mut open, 560.0, |ui| {
-            let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), egui::Sense::hover());
+            let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), egui::Sense::hover());
             ui.painter().rect_filled(banner, egui::CornerRadius::ZERO, Color32::BLACK);
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(banner.shrink2(vec2(150.0, 6.0))));
-            classic::wordmark(&mut child, 50.0, true);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(banner.shrink2(vec2(160.0, 5.0))));
+            classic::wordmark(&mut child, 42.0, true);
             ui.add_space(4.0);
             let fw = 170.0;
-            classic::group(ui, "Miscellaneous Settings", |ui| {
-                egui::Grid::new("misc").num_columns(4).spacing([8.0, 5.0]).show(ui, |ui| {
-                    ui.label("User Name:");
-                    classic::text_field(ui, &mut draft.nick, fw);
-                    ui.label("Data Port:");
-                    let mut port = draft.data_port.to_string();
-                    if classic::text_field(ui, &mut port, 70.0).changed() {
-                        draft.data_port = port.trim().parse().unwrap_or(0);
-                    }
-                    ui.end_row();
-
-                    ui.label("Password:");
-                    classic::text_field_ex(ui, &mut draft.password, fw, true, "");
-                    ui.label("Line Speed:");
-                    egui::ComboBox::from_id_salt("speed")
-                        .width(110.0)
-                        .selected_text(link_speed_name(draft.link_speed))
-                        .show_ui(ui, |ui| {
-                            for (i, name) in LINK_SPEEDS.iter().enumerate() {
-                                ui.selectable_value(&mut draft.link_speed, i as u32, *name);
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label("Email:");
-                    classic::text_field(ui, &mut draft.email, fw);
-                    ui.end_row();
-                });
-                if !draft.nick.is_empty() && !napster_proto::valid_nick(&draft.nick) {
-                    ui.colored_label(C_ERROR, "Name contains invalid characters! Please choose another name!");
-                }
-                ui.add_space(4.0);
-                egui::Grid::new("paths").num_columns(3).spacing([8.0, 5.0]).show(ui, |ui| {
-                    ui.label("Library Paths:");
-                    let mut paths = draft.shared_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
-                    if classic::text_field(ui, &mut paths, 300.0).changed() {
-                        draft.shared_dirs = paths.split(';').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
-                    }
-                    if classic::button(ui, "Add Path", Some(90.0)).clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            draft.shared_dirs.push(p);
-                        }
-                    }
-                    ui.end_row();
-                    ui.label("Save Directory:");
-                    let mut dl = draft.download_dir.display().to_string();
-                    if classic::text_field(ui, &mut dl, 300.0).changed() {
-                        draft.download_dir = PathBuf::from(dl);
-                    }
-                    if classic::button(ui, "Choose Dir.", Some(90.0)).clicked() {
-                        if let Some(p) = rfd::FileDialog::new().set_directory(&draft.download_dir).pick_folder() {
-                            draft.download_dir = p;
-                        }
-                    }
-                    ui.end_row();
-                });
-                ui.add_space(4.0);
-                ui.checkbox(&mut draft.auto_connect, "Connect to the Server when Napster starts");
-                ui.checkbox(&mut draft.check_for_updates, "Check for new versions of Napster when it starts");
-            });
-            ui.add_space(6.0);
-            classic::group(ui, "Server Settings", |ui| {
-                egui::Grid::new("srv").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
-                    ui.label("Server (host:port):");
-                    classic::text_field(ui, &mut draft.server, 240.0);
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut draft.use_metaserver, "This is a metaserver (redirector, port 8875)");
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut draft.tls, "Encrypt the connection (TLS; napd's port 8889)");
-                    ui.end_row();
-                });
-            });
-            ui.add_space(6.0);
-            classic::group(ui, "Transfer Settings", |ui| {
-                egui::Grid::new("xfer").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
-                    ui.label("Max Simultaneous Uploads:");
-                    let mut up = draft.max_uploads.to_string();
-                    if classic::text_field(ui, &mut up, 50.0).changed() {
-                        draft.max_uploads = up.trim().parse().unwrap_or(0).min(50);
-                    }
-                    ui.end_row();
-                    ui.label("Max Simultaneous Downloads (rest will be queued):");
-                    let mut down = draft.max_downloads.to_string();
-                    if classic::text_field(ui, &mut down, 50.0).changed() {
-                        draft.max_downloads = down.trim().parse().unwrap_or(1).clamp(1, 50);
-                    }
-                    ui.end_row();
-                });
-                if draft.max_uploads == 0 {
-                    ui.colored_label(C_ERROR, "Your file server is currently disabled (max outbound transfers = 0).");
-                }
-                ui.add_space(4.0);
-                ui.checkbox(&mut draft.authentic_speeds, "Authentic speeds: transfer at the real speed of my Line Speed");
-                if draft.authentic_speeds {
-                    let (d, u) = napster_core::PERIOD_RATES[draft.link_speed.min(10) as usize];
-                    let text = if d == 0.0 {
-                        "Line Speed is Unknown, so transfers are not limited.".to_owned()
-                    } else {
-                        format!(
-                            "{}: downloads up to {} KB/s, uploads up to {} KB/s (shared by all transfers).",
-                            link_speed_name(draft.link_speed),
-                            d,
-                            u
-                        )
-                    };
-                    ui.label(RichText::new(text).color(C_SYSTEM));
-                } else {
-                    egui::Grid::new("limits").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
-                        ui.label("Max Download Speed, all transfers (KB/s, 0 = unlimited):");
-                        let mut lim = draft.download_limit_kbps.to_string();
-                        if classic::text_field(ui, &mut lim, 60.0).changed() {
-                            draft.download_limit_kbps = lim.trim().parse().unwrap_or(0);
+            // the settings scroll so OK/Cancel stay visible in small windows
+            let max_h = (ctx.screen_rect().height() - 150.0).max(160.0);
+            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                classic::group(ui, "Miscellaneous Settings", |ui| {
+                    egui::Grid::new("misc").num_columns(4).spacing([8.0, 5.0]).show(ui, |ui| {
+                        ui.label("User Name:");
+                        classic::text_field(ui, &mut draft.nick, fw);
+                        ui.label("Data Port:");
+                        let mut port = draft.data_port.to_string();
+                        if classic::text_field(ui, &mut port, 70.0).changed() {
+                            draft.data_port = port.trim().parse().unwrap_or(0);
                         }
                         ui.end_row();
-                        ui.label("Max Upload Speed, all transfers (KB/s, 0 = unlimited):");
-                        let mut lim = draft.upload_limit_kbps.to_string();
-                        if classic::text_field(ui, &mut lim, 60.0).changed() {
-                            draft.upload_limit_kbps = lim.trim().parse().unwrap_or(0);
+
+                        ui.label("Password:");
+                        classic::text_field_ex(ui, &mut draft.password, fw, true, "");
+                        ui.label("Line Speed:");
+                        egui::ComboBox::from_id_salt("speed")
+                            .width(110.0)
+                            .selected_text(link_speed_name(draft.link_speed))
+                            .show_ui(ui, |ui| {
+                                for (i, name) in LINK_SPEEDS.iter().enumerate() {
+                                    ui.selectable_value(&mut draft.link_speed, i as u32, *name);
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Email:");
+                        classic::text_field(ui, &mut draft.email, fw);
+                        ui.end_row();
+                    });
+                    if !draft.nick.is_empty() && !napster_proto::valid_nick(&draft.nick) {
+                        ui.colored_label(C_ERROR, "Name contains invalid characters! Please choose another name!");
+                    }
+                    ui.add_space(4.0);
+                    egui::Grid::new("paths").num_columns(3).spacing([8.0, 5.0]).show(ui, |ui| {
+                        ui.label("Library Paths:");
+                        let mut paths =
+                            draft.shared_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
+                        if classic::text_field(ui, &mut paths, 300.0).changed() {
+                            draft.shared_dirs =
+                                paths.split(';').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+                        }
+                        if classic::button(ui, "Add Path", Some(90.0)).clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                draft.shared_dirs.push(p);
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("Save Directory:");
+                        let mut dl = draft.download_dir.display().to_string();
+                        if classic::text_field(ui, &mut dl, 300.0).changed() {
+                            draft.download_dir = PathBuf::from(dl);
+                        }
+                        if classic::button(ui, "Choose Dir.", Some(90.0)).clicked() {
+                            if let Some(p) = rfd::FileDialog::new().set_directory(&draft.download_dir).pick_folder() {
+                                draft.download_dir = p;
+                            }
                         }
                         ui.end_row();
                     });
-                }
-                ui.label(
-                    RichText::new("Data Port 0 means you are behind a firewall; your uploads will be pushed.")
-                        .color(classic::DISABLED),
-                );
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut draft.auto_connect, "Connect to the Server when Napster starts");
+                    ui.checkbox(&mut draft.check_for_updates, "Check for new versions of Napster when it starts");
+                });
+                ui.add_space(6.0);
+                classic::group(ui, "Server Settings", |ui| {
+                    egui::Grid::new("srv").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                        ui.label("Server (host:port):");
+                        classic::text_field(ui, &mut draft.server, 240.0);
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut draft.use_metaserver, "This is a metaserver (redirector, port 8875)");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut draft.tls, "Encrypt the connection (TLS; napd's port 8889)");
+                        ui.end_row();
+                    });
+                });
+                ui.add_space(6.0);
+                classic::group(ui, "Firewall Settings", |ui| {
+                    ui.checkbox(&mut draft.proxy.enabled, "Connect through a SOCKS5 proxy");
+                    ui.add_enabled_ui(draft.proxy.enabled, |ui| {
+                        egui::Grid::new("proxy").num_columns(4).spacing([8.0, 5.0]).show(ui, |ui| {
+                            ui.label("Proxy Server:");
+                            classic::text_field(ui, &mut draft.proxy.host, 200.0);
+                            ui.label("Port:");
+                            let mut port = draft.proxy.port.to_string();
+                            if classic::text_field(ui, &mut port, 60.0).changed() {
+                                draft.proxy.port = port.trim().parse().unwrap_or(1080);
+                            }
+                            ui.end_row();
+                            ui.label("User Name:");
+                            classic::text_field(ui, &mut draft.proxy.username, 200.0);
+                            ui.label("Password:");
+                            classic::text_field_ex(ui, &mut draft.proxy.password, 120.0, true, "");
+                            ui.end_row();
+                        });
+                        ui.checkbox(&mut draft.proxy.transfers, "Also send file transfers through the proxy");
+                    });
+                });
+                ui.add_space(6.0);
+                classic::group(ui, "Transfer Settings", |ui| {
+                    egui::Grid::new("xfer").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                        ui.label("Max Simultaneous Uploads:");
+                        let mut up = draft.max_uploads.to_string();
+                        if classic::text_field(ui, &mut up, 50.0).changed() {
+                            draft.max_uploads = up.trim().parse().unwrap_or(0).min(50);
+                        }
+                        ui.end_row();
+                        ui.label("Max Simultaneous Downloads (rest will be queued):");
+                        let mut down = draft.max_downloads.to_string();
+                        if classic::text_field(ui, &mut down, 50.0).changed() {
+                            draft.max_downloads = down.trim().parse().unwrap_or(1).clamp(1, 50);
+                        }
+                        ui.end_row();
+                    });
+                    if draft.max_uploads == 0 {
+                        ui.colored_label(
+                            C_ERROR,
+                            "Your file server is currently disabled (max outbound transfers = 0).",
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut draft.authentic_speeds,
+                        "Authentic speeds: transfer at the real speed of my Line Speed",
+                    );
+                    if draft.authentic_speeds {
+                        let (d, u) = napster_core::PERIOD_RATES[draft.link_speed.min(10) as usize];
+                        let text = if d == 0.0 {
+                            "Line Speed is Unknown, so transfers are not limited.".to_owned()
+                        } else {
+                            format!(
+                                "{}: downloads up to {} KB/s, uploads up to {} KB/s (shared by all transfers).",
+                                link_speed_name(draft.link_speed),
+                                d,
+                                u
+                            )
+                        };
+                        ui.label(RichText::new(text).color(C_SYSTEM));
+                    } else {
+                        egui::Grid::new("limits").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                            ui.label("Max Download Speed, all transfers (KB/s, 0 = unlimited):");
+                            let mut lim = draft.download_limit_kbps.to_string();
+                            if classic::text_field(ui, &mut lim, 60.0).changed() {
+                                draft.download_limit_kbps = lim.trim().parse().unwrap_or(0);
+                            }
+                            ui.end_row();
+                            ui.label("Max Upload Speed, all transfers (KB/s, 0 = unlimited):");
+                            let mut lim = draft.upload_limit_kbps.to_string();
+                            if classic::text_field(ui, &mut lim, 60.0).changed() {
+                                draft.upload_limit_kbps = lim.trim().parse().unwrap_or(0);
+                            }
+                            ui.end_row();
+                        });
+                    }
+                    ui.label(
+                        RichText::new("Data Port 0 means you are behind a firewall; your uploads will be pushed.")
+                            .color(classic::DISABLED),
+                    );
+                });
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1801,7 +2058,7 @@ impl App {
         if save {
             self.config = draft;
             self.save_config();
-            self.client.send(Command::SetConfig(self.config.clone()));
+            self.client.send(Command::SetConfig(Box::new(self.config.clone())));
             self.log(Line::sys("Preferences saved."));
         } else if !cancel && open {
             self.prefs = Some(draft);
@@ -1815,75 +2072,75 @@ impl App {
         let mut next: Option<Option<UpdateStep>> = None;
         let mut install: Option<napster_core::UpdateInfo> = None;
         let mut restart: Option<PathBuf> = None;
-        classic::dialog(ctx, "update", "Napster Update", &mut open, 420.0, |ui| {
-            match step {
-                UpdateStep::Available(info) => {
-                    ui.label(bold(format!("Napster (napster-rs) {} is available.", info.version)));
-                    ui.label(format!("You have version {current}."));
-                    ui.add_space(4.0);
-                    if !info.notes.trim().is_empty() {
-                        classic::sunken(ui, vec2(406.0, 140.0), Color32::WHITE, |ui| {
-                            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                                ui.label(info.notes.trim());
-                            });
+        classic::dialog(ctx, "update", "Napster Update", &mut open, 420.0, |ui| match step {
+            UpdateStep::Available(info) => {
+                ui.label(bold(format!("Napster (napster-rs) {} is available.", info.version)));
+                ui.label(format!("You have version {current}."));
+                ui.add_space(4.0);
+                if !info.notes.trim().is_empty() {
+                    classic::sunken(ui, vec2(406.0, 140.0), Color32::WHITE, |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            ui.label(info.notes.trim());
                         });
-                        ui.add_space(4.0);
-                    }
-                    ui.label(
-                        RichText::new("The update is downloaded from GitHub and its signature is checked before it is installed.")
-                            .color(classic::DISABLED),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
-                        if classic::button(ui, "Update Now", Some(96.0)).clicked() {
-                            install = Some(info.clone());
-                        }
-                        if classic::button(ui, "Later", Some(96.0)).clicked() {
-                            next = Some(None);
-                        }
-                    });
-                }
-                UpdateStep::Working(msg) => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(msg);
                     });
                     ui.add_space(4.0);
                 }
-                UpdateStep::Installed { version, relaunch } => {
-                    ui.label(bold(format!("Napster has been updated to {version}.")));
-                    ui.label("Restart Napster to use the new version.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
-                        if classic::button(ui, "Restart Now", Some(96.0)).clicked() {
-                            restart = Some(relaunch.clone());
-                        }
-                        if classic::button(ui, "Later", Some(96.0)).clicked() {
-                            next = Some(None);
-                        }
-                    });
-                }
-                UpdateStep::Failed(e) => {
-                    ui.colored_label(C_ERROR, format!("Error while auto upgrading: {e}"));
-                    ui.label("You can download the latest version from the GitHub releases page.");
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        if classic::button(ui, "OK", Some(84.0)).clicked() {
-                            next = Some(None);
-                        }
-                    });
-                }
-                UpdateStep::UpToDate => {
-                    ui.label(format!("You have the latest version of Napster (napster-rs {current})."));
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        if classic::button(ui, "OK", Some(84.0)).clicked() {
-                            next = Some(None);
-                        }
-                    });
-                }
+                ui.label(
+                    RichText::new(
+                        "The update is downloaded from GitHub and its signature is checked before it is installed.",
+                    )
+                    .color(classic::DISABLED),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
+                    if classic::button(ui, "Update Now", Some(96.0)).clicked() {
+                        install = Some(info.clone());
+                    }
+                    if classic::button(ui, "Later", Some(96.0)).clicked() {
+                        next = Some(None);
+                    }
+                });
+            }
+            UpdateStep::Working(msg) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(msg);
+                });
+                ui.add_space(4.0);
+            }
+            UpdateStep::Installed { version, relaunch } => {
+                ui.label(bold(format!("Napster has been updated to {version}.")));
+                ui.label("Restart Napster to use the new version.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
+                    if classic::button(ui, "Restart Now", Some(96.0)).clicked() {
+                        restart = Some(relaunch.clone());
+                    }
+                    if classic::button(ui, "Later", Some(96.0)).clicked() {
+                        next = Some(None);
+                    }
+                });
+            }
+            UpdateStep::Failed(e) => {
+                ui.colored_label(C_ERROR, format!("Error while auto upgrading: {e}"));
+                ui.label("You can download the latest version from the GitHub releases page.");
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    if classic::button(ui, "OK", Some(84.0)).clicked() {
+                        next = Some(None);
+                    }
+                });
+            }
+            UpdateStep::UpToDate => {
+                ui.label(format!("You have the latest version of Napster (napster-rs {current})."));
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    if classic::button(ui, "OK", Some(84.0)).clicked() {
+                        next = Some(None);
+                    }
+                });
             }
         });
         if let Some(info) = install {
@@ -1913,7 +2170,9 @@ impl App {
     // ------------------------------------------------------------ snapshots
 
     fn drive_snapshots(&mut self, ctx: &egui::Context) {
-        let Some(mut s) = self.snap.take() else { return };
+        let Some(mut s) = self.snap.take() else {
+            return;
+        };
         ctx.request_repaint();
         match s.phase {
             Phase::Starting => {
@@ -1953,7 +2212,16 @@ impl App {
                 match shot {
                     Shot::Home => self.tab = Tab::Home,
                     Shot::Chat | Shot::Whois => self.tab = Tab::Chat,
-                    Shot::Library => self.tab = Tab::Library,
+                    Shot::Library => {
+                        self.tab = Tab::Library;
+                        if self.player.playlist.is_empty() {
+                            for f in self.library.iter().take(3) {
+                                self.player.enqueue(PathBuf::from(&f.filename));
+                            }
+                            self.player.current = Some(0);
+                            self.player.selected = Some(0);
+                        }
+                    }
                     Shot::Search => self.tab = Tab::Search,
                     Shot::HotList => self.tab = Tab::HotList,
                     Shot::Transfer => {
@@ -1977,7 +2245,9 @@ impl App {
                     self.snap_whois = stashed;
                 }
                 if s.elapsed().as_millis() > 700 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(shot.name().to_owned())));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                        shot.name().to_owned(),
+                    )));
                     s.go(Phase::Capture(i));
                 }
             }
@@ -2013,12 +2283,21 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.player.tick();
+        if self.player.state() == crate::player::State::Playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         self.drive_snapshots(ctx);
         self.menu_bar(ctx);
         self.tab_bar(ctx);
         self.status_bar(ctx);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 6 }))
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: 4,
+                bottom: 6,
+            }))
             .show(ctx, |ui| match self.tab {
                 Tab::Home => self.home(ui),
                 Tab::Chat => self.chat_tab(ui),

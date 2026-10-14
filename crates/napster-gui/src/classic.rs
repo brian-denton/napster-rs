@@ -134,11 +134,8 @@ pub fn install(ctx: &egui::Context) {
 /// Classic two-pixel 3D border. Raised for buttons, sunken for fields.
 pub fn bevel(p: &egui::Painter, r: Rect, raised: bool) {
     let r = r.shrink(0.5);
-    let (outer_tl, inner_tl, inner_br, outer_br) = if raised {
-        (HILIGHT, FACE_LIGHT, SHADOW, DARK)
-    } else {
-        (SHADOW, DARK, FACE_LIGHT, HILIGHT)
-    };
+    let (outer_tl, inner_tl, inner_br, outer_br) =
+        if raised { (HILIGHT, FACE_LIGHT, SHADOW, DARK) } else { (SHADOW, DARK, FACE_LIGHT, HILIGHT) };
     let line = |a: Pos2, b: Pos2, c: Color32| p.line_segment([a, b], Stroke::new(1.0_f32, c));
     line(r.left_bottom(), r.left_top(), outer_tl);
     line(r.left_top(), r.right_top(), outer_tl);
@@ -162,7 +159,12 @@ pub fn thin_sunken(p: &egui::Painter, r: Rect) {
 
 /// Etched line (group boxes, separators).
 fn etched_rect(p: &egui::Painter, r: Rect) {
-    p.rect_stroke(r.translate(vec2(1.0, 1.0)), CornerRadius::ZERO, Stroke::new(1.0_f32, HILIGHT), egui::StrokeKind::Inside);
+    p.rect_stroke(
+        r.translate(vec2(1.0, 1.0)),
+        CornerRadius::ZERO,
+        Stroke::new(1.0_f32, HILIGHT),
+        egui::StrokeKind::Inside,
+    );
     p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0_f32, SHADOW), egui::StrokeKind::Inside);
 }
 
@@ -173,7 +175,13 @@ pub fn button(ui: &mut Ui, text: impl Into<WidgetText>, width: Option<f32>) -> R
     button_ex(ui, text, width, true, false)
 }
 
-pub fn button_ex(ui: &mut Ui, text: impl Into<WidgetText>, width: Option<f32>, enabled: bool, pushed: bool) -> Response {
+pub fn button_ex(
+    ui: &mut Ui,
+    text: impl Into<WidgetText>,
+    width: Option<f32>,
+    enabled: bool,
+    pushed: bool,
+) -> Response {
     let text: WidgetText = text.into();
     let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Button);
     let w = width.unwrap_or(galley.size().x + 22.0).max(galley.size().x + 8.0);
@@ -273,7 +281,11 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon) {
             p.circle_filled(at(12.0, 11.0), 2.8, red);
             p.line_segment([at(7.0, 12.5), at(7.0, 2.0)], Stroke::new(1.6_f32, red));
             p.line_segment([at(14.5, 11.0), at(14.5, 0.8)], Stroke::new(1.6_f32, red));
-            p.add(Shape::convex_polygon(vec![at(7.0, 2.0), at(14.5, 0.5), at(14.5, 3.5), at(7.0, 5.0)], red, Stroke::NONE));
+            p.add(Shape::convex_polygon(
+                vec![at(7.0, 2.0), at(14.5, 0.5), at(14.5, 3.5), at(7.0, 5.0)],
+                red,
+                Stroke::NONE,
+            ));
         }
         Icon::Help => {
             p.circle_filled(at(8.0, 8.0), 7.0, Color32::from_rgb(0x20, 0x40, 0xb0));
@@ -312,6 +324,71 @@ pub fn tab_button(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Respo
     resp
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Media {
+    Prev,
+    Play,
+    Pause,
+    Stop,
+    Next,
+}
+
+/// Small square transport button with a drawn symbol.
+pub fn media_button(ui: &mut Ui, kind: Media, active: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 23.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let down = active || resp.is_pointer_button_down_on();
+        p.rect_filled(rect, CornerRadius::ZERO, if active { FACE_LIGHT } else { FACE });
+        bevel(p, rect, !down);
+        let c = rect.center() + if down { vec2(1.0, 1.0) } else { Vec2::ZERO };
+        let ink = Color32::from_gray(20);
+        let tri = |dir: f32, x: f32| {
+            let (l, r) = (c.x + x - 4.0 * dir, c.x + x + 4.0 * dir);
+            Shape::convex_polygon(vec![pos2(l, c.y - 5.0), pos2(r, c.y), pos2(l, c.y + 5.0)], ink, Stroke::NONE)
+        };
+        match kind {
+            Media::Play => {
+                p.add(tri(1.0, 1.0));
+            }
+            Media::Pause => {
+                p.rect_filled(Rect::from_center_size(c - vec2(3.0, 0.0), vec2(3.0, 10.0)), CornerRadius::ZERO, ink);
+                p.rect_filled(Rect::from_center_size(c + vec2(3.0, 0.0), vec2(3.0, 10.0)), CornerRadius::ZERO, ink);
+            }
+            Media::Stop => {
+                p.rect_filled(Rect::from_center_size(c, vec2(9.0, 9.0)), CornerRadius::ZERO, ink);
+            }
+            Media::Prev => {
+                p.rect_filled(Rect::from_center_size(c - vec2(5.5, 0.0), vec2(2.0, 10.0)), CornerRadius::ZERO, ink);
+                p.add(tri(-1.0, 0.5));
+            }
+            Media::Next => {
+                p.add(tri(1.0, -0.5));
+                p.rect_filled(Rect::from_center_size(c + vec2(5.5, 0.0), vec2(2.0, 10.0)), CornerRadius::ZERO, ink);
+            }
+        }
+    }
+    resp
+}
+
+/// The player's LCD-style display: black panel, green text.
+pub fn lcd(ui: &mut Ui, lines: (&str, &str), width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0x05, 0x10, 0x05));
+    bevel(p, rect, false);
+    let green = Color32::from_rgb(0x40, 0xff, 0x60);
+    let clip = p.with_clip_rect(rect.shrink(3.0));
+    clip.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, lines.0, FontId::monospace(12.0), green);
+    clip.text(
+        rect.left_top() + vec2(6.0, 18.0),
+        Align2::LEFT_TOP,
+        lines.1,
+        FontId::monospace(11.0),
+        Color32::from_rgb(0x30, 0xc0, 0x40),
+    );
+}
+
 /// Etched group box with a caption ("Search Fields").
 pub fn group<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     let title_g = ui.painter().layout_no_wrap(title.to_owned(), FontId::proportional(12.0), TEXT);
@@ -327,7 +404,11 @@ pub fn group<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = ui.painter();
     etched_rect(p, box_rect);
     let tpos = pos2(box_rect.left() + 8.0, top);
-    p.rect_filled(Rect::from_min_size(tpos - vec2(2.0, 0.0), title_g.size() + vec2(4.0, 0.0)), CornerRadius::ZERO, FACE);
+    p.rect_filled(
+        Rect::from_min_size(tpos - vec2(2.0, 0.0), title_g.size() + vec2(4.0, 0.0)),
+        CornerRadius::ZERO,
+        FACE,
+    );
     p.galley(tpos, title_g, TEXT);
     inner.inner
 }
@@ -337,7 +418,8 @@ pub fn sunken<R>(ui: &mut Ui, size: Vec2, fill: Color32, add: impl FnOnce(&mut U
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
     let inner_rect = rect.shrink(2.0);
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().max_rect(inner_rect).layout(egui::Layout::top_down(egui::Align::Min)));
     child.set_clip_rect(inner_rect.intersect(ui.clip_rect()));
     let r = add(&mut child);
     bevel(ui.painter(), rect, false);

@@ -40,19 +40,8 @@ pub const DATA_PORT: u16 = 6699;
 pub const CLIENT_BUILD: u32 = 5151;
 
 /// Link speeds as used by the login (2) message and in search results.
-pub const LINK_SPEEDS: [&str; 11] = [
-    "Unknown",
-    "14.4 Kbps",
-    "28.8 Kbps",
-    "33.6 Kbps",
-    "56K",
-    "ISDN-64K",
-    "ISDN-128K",
-    "Cable",
-    "DSL",
-    "T1",
-    "T3+",
-];
+pub const LINK_SPEEDS: [&str; 11] =
+    ["Unknown", "14.4 Kbps", "28.8 Kbps", "33.6 Kbps", "56K", "ISDN-64K", "ISDN-128K", "Cable", "DSL", "T1", "T3+"];
 
 pub fn link_speed_name(speed: u32) -> &'static str {
     LINK_SPEEDS.get(speed as usize).copied().unwrap_or("Unknown")
@@ -62,9 +51,7 @@ pub fn link_speed_name(speed: u32) -> &'static str {
 pub fn valid_nick(nick: &str) -> bool {
     !nick.is_empty()
         && nick.len() <= 30
-        && nick
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_[]{}-@^!$|`".contains(c))
+        && nick.chars().all(|c| c.is_ascii_alphanumeric() || "_[]{}-@^!$|`".contains(c))
 }
 
 #[cfg(test)]

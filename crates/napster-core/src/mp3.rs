@@ -157,14 +157,19 @@ pub fn analyze(head: &[u8], file_len: u64) -> Option<AudioInfo> {
     Some(AudioInfo { start, bitrate: h.bitrate, sample_rate: h.sample_rate, seconds })
 }
 
-/// Build a silent-ish CBR MPEG-1 layer III stream (for tests and demos).
+/// Build a playable, silent CBR MPEG-1 layer III stream (for tests and
+/// demos). Each frame's side info is zeroed, so it decodes to silence;
+/// the rest of the frame is filler that decoders skip, varied so files
+/// don't all hash alike.
 pub fn synth_mp3(frames: usize, bitrate_idx: u8) -> Vec<u8> {
     let header = [0xff, 0xfb, (bitrate_idx << 4), 0x00];
     let h = FrameHeader::parse(&header).expect("valid header");
+    let side_info = 32; // MPEG-1, stereo
     let mut out = Vec::with_capacity(frames * h.frame_len());
     for i in 0..frames {
         out.extend_from_slice(&header);
-        out.extend((4..h.frame_len()).map(|j| ((i * 31 + j * 7) % 251) as u8));
+        out.extend(std::iter::repeat_n(0u8, side_info));
+        out.extend((4 + side_info..h.frame_len()).map(|j| ((i * 31 + j * 7) % 251) as u8));
     }
     out
 }

@@ -313,10 +313,7 @@ mod tests {
         expect_ack(&mut b).await.unwrap();
         send_get(&mut b, "lefty", "C:\\MP3\\song.mp3", 1234).await.unwrap();
         let (req, mut a) = server.await.unwrap().unwrap();
-        assert_eq!(
-            req,
-            PeerRequest::Get { nick: "lefty".into(), filename: "C:\\MP3\\song.mp3".into(), offset: 1234 }
-        );
+        assert_eq!(req, PeerRequest::Get { nick: "lefty".into(), filename: "C:\\MP3\\song.mp3".into(), offset: 1234 });
         a.write_all(b"5000\xff\xfbdata").await.unwrap();
         match read_size(&mut b, Some(5000)).await.unwrap() {
             SizeReply::Size(n, rest) => {

@@ -16,6 +16,7 @@ anyhow.workspace = true
 eframe = "0.31"
 egui_extras = "0.31"
 rfd = "0.15"
+rodio = { version = "0.20", default-features = false, features = ["symphonia-mp3", "symphonia-wav", "symphonia-flac", "symphonia-vorbis"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

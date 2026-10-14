@@ -24,6 +24,16 @@ struct Args {
     /// Encrypt the server connection (napd's TLS port, 8889).
     #[arg(long)]
     tls: bool,
+    /// Connect through a SOCKS5 proxy, `host:port`.
+    #[arg(long, value_name = "HOST:PORT")]
+    proxy: Option<String>,
+    #[arg(long, requires = "proxy")]
+    proxy_user: Option<String>,
+    #[arg(long, requires = "proxy")]
+    proxy_password: Option<String>,
+    /// Don't send file transfers through the proxy (server connection only).
+    #[arg(long, requires = "proxy")]
+    proxy_server_only: bool,
     #[arg(long)]
     nick: Option<String>,
     #[arg(long)]
@@ -88,9 +98,7 @@ struct Ui {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
@@ -107,6 +115,17 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.tls {
         config.tls = true;
+    }
+    if let Some(p) = &args.proxy {
+        let (host, port) = p.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("--proxy needs host:port"))?;
+        config.proxy = napster_core::proxy::ProxyConfig {
+            enabled: true,
+            host: host.to_owned(),
+            port: port.parse()?,
+            username: args.proxy_user.clone().unwrap_or_default(),
+            password: args.proxy_password.clone().unwrap_or_default(),
+            transfers: !args.proxy_server_only,
+        };
     }
     if let Some(n) = args.nick {
         config.nick = n;
@@ -162,7 +181,14 @@ async fn main() -> anyhow::Result<()> {
 
     let (client, mut events) = Client::start(config, None);
     client.send(Command::Connect);
-    let mut ui = Ui { client, results: vec![], room: None, transfers: BTreeMap::new(), files: vec![], install_when_found: false };
+    let mut ui = Ui {
+        client,
+        results: vec![],
+        room: None,
+        transfers: BTreeMap::new(),
+        files: vec![],
+        install_when_found: false,
+    };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {

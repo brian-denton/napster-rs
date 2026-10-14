@@ -261,9 +261,7 @@ async fn chat_and_private_messages() {
         })
         .await;
     assert_eq!(users, vec!["alice", "bob"]);
-    alice
-        .wait(|e| matches!(e, Event::UserJoined { user, .. } if user.nick == "bob").then_some(()))
-        .await;
+    alice.wait(|e| matches!(e, Event::UserJoined { user, .. } if user.nick == "bob").then_some(())).await;
 
     alice.client.send(Command::Say { channel: "Lobby".into(), text: "hello  world".into() });
     let (nick, text) = bob

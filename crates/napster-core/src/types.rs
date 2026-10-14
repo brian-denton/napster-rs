@@ -12,12 +12,15 @@ pub enum Command {
     Connect,
     Disconnect,
     /// Replace settings (takes effect for the data port on next connect).
-    SetConfig(ClientConfig),
+    SetConfig(Box<ClientConfig>),
     /// Rescan shared folders and re-share.
     Rescan,
     Search(SearchQuery),
     /// Queue a download of `file` from `nick`.
-    Download { nick: String, file: FileInfo },
+    Download {
+        nick: String,
+        file: FileInfo,
+    },
     CancelTransfer(u64),
     /// Forget finished/failed transfers.
     ClearFinished,
@@ -26,12 +29,24 @@ pub enum Command {
     Whois(String),
     Ping(String),
     PingServer,
-    PrivateMessage { to: String, text: String },
+    PrivateMessage {
+        to: String,
+        text: String,
+    },
     Join(String),
     Part(String),
-    Say { channel: String, text: String },
-    Emote { channel: String, text: String },
-    SetTopic { channel: String, topic: String },
+    Say {
+        channel: String,
+        text: String,
+    },
+    Emote {
+        channel: String,
+        text: String,
+    },
+    SetTopic {
+        channel: String,
+        topic: String,
+    },
     ListChannels,
     HotlistAdd(String),
     HotlistRemove(String),
@@ -40,7 +55,9 @@ pub enum Command {
     /// Send an arbitrary message (for /raw and admin commands).
     Raw(u16, String),
     /// Look for a newer release. `manual` also reports "up to date" and errors.
-    CheckForUpdate { manual: bool },
+    CheckForUpdate {
+        manual: bool,
+    },
     /// Download, verify and install a release found by `CheckForUpdate`.
     InstallUpdate(UpdateInfo),
 }
@@ -151,37 +168,91 @@ pub enum Event {
     Info(String),
     Error(String),
     Motd(String),
-    Stats { users: u64, files: u64, gigabytes: u64 },
-    LibraryScanning { done: usize, total: usize },
+    Stats {
+        users: u64,
+        files: u64,
+        gigabytes: u64,
+    },
+    LibraryScanning {
+        done: usize,
+        total: usize,
+    },
     Library(Vec<FileInfo>),
     SearchResult(SearchResult),
     SearchEnd,
     BrowseResult(SearchResult),
-    BrowseEnd { nick: String },
+    BrowseEnd {
+        nick: String,
+    },
     Transfer(TransferInfo),
     TransferRemoved(u64),
-    PrivateMessage { from: String, text: String },
-    Joined { channel: String },
-    Parted { channel: String },
-    ChannelUsers { channel: String, users: Vec<ChannelUser> },
-    UserJoined { channel: String, user: ChannelUser },
-    UserParted { channel: String, nick: String },
-    ChannelMessage { channel: String, nick: String, text: String },
-    ChannelEmote { channel: String, nick: String, text: String },
-    Topic { channel: String, topic: String },
+    PrivateMessage {
+        from: String,
+        text: String,
+    },
+    Joined {
+        channel: String,
+    },
+    Parted {
+        channel: String,
+    },
+    ChannelUsers {
+        channel: String,
+        users: Vec<ChannelUser>,
+    },
+    UserJoined {
+        channel: String,
+        user: ChannelUser,
+    },
+    UserParted {
+        channel: String,
+        nick: String,
+    },
+    ChannelMessage {
+        channel: String,
+        nick: String,
+        text: String,
+    },
+    ChannelEmote {
+        channel: String,
+        nick: String,
+        text: String,
+    },
+    Topic {
+        channel: String,
+        topic: String,
+    },
     ChannelList(Vec<(String, u32, String)>),
-    HotlistOnline { nick: String, link_speed: u32 },
-    HotlistOffline { nick: String },
+    HotlistOnline {
+        nick: String,
+        link_speed: u32,
+    },
+    HotlistOffline {
+        nick: String,
+    },
     Whois(Vec<(String, String)>),
-    Pong { nick: String },
-    ServerPong { millis: u64 },
-    Announcement { from: String, text: String },
-    ChannelInvite { from: String, channel: String },
+    Pong {
+        nick: String,
+    },
+    ServerPong {
+        millis: u64,
+    },
+    Announcement {
+        from: String,
+        text: String,
+    },
+    ChannelInvite {
+        from: String,
+        channel: String,
+    },
     UpdateAvailable(UpdateInfo),
     /// Reply to a manual check when there's nothing newer.
     UpToDate,
     UpdateProgress(String),
     /// Installed; launching `relaunch` starts the new version.
-    UpdateInstalled { version: String, relaunch: std::path::PathBuf },
+    UpdateInstalled {
+        version: String,
+        relaunch: std::path::PathBuf,
+    },
     UpdateFailed(String),
 }

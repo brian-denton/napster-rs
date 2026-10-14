@@ -134,7 +134,11 @@ fn walk(dir: &Path, exts: &[String], out: &mut Vec<PathBuf>, depth: usize) {
         if ft.is_dir() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
             // same exclusions as the original drive scan
-            if name == "recycle" || name == "$recycle.bin" || name == "system volume information" || name == "incomplete" {
+            if name == "recycle"
+                || name == "$recycle.bin"
+                || name == "system volume information"
+                || name == "incomplete"
+            {
                 continue;
             }
             walk(&path, exts, out, depth + 1);
@@ -166,7 +170,8 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
     for (i, path) in paths.into_iter().enumerate() {
         progress(i, total);
         let Ok(meta) = std::fs::metadata(&path) else { continue };
-        let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+        let mtime =
+            meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
         let key = path.to_string_lossy().into_owned();
         if let Some(c) = cache.get(&key).filter(|c| c.size == meta.len() && c.mtime == mtime) {
             files.push(SharedFile {

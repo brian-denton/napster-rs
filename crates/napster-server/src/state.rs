@@ -70,6 +70,10 @@ pub struct Session {
     pub connected: Instant,
     pub muzzled: bool,
     pub cloaked: bool,
+    /// Wall-clock login time; the earlier login wins a network nick collision.
+    pub login_ms: u64,
+    /// Share count last announced to linked servers.
+    pub announced_shares: u32,
 }
 
 impl Session {
@@ -120,6 +124,12 @@ pub struct State {
     /// keyed by lower-case channel name
     pub channels: BTreeMap<String, Channel>,
     pub db: Db,
+    /// Linked servers, by link id.
+    pub links: HashMap<u64, crate::link::LinkHandle>,
+    /// Users on linked servers, keyed by lower-case nick.
+    pub remote: HashMap<String, crate::link::RemoteUser>,
+    /// Searches waiting on linked servers.
+    pub searches: HashMap<u64, crate::link::PendingSearch>,
 }
 
 impl State {
@@ -143,9 +153,12 @@ impl State {
 
     /// `<users> <files> <gigabytes>`
     pub fn stats(&self) -> String {
-        let files: usize = self.sessions.values().map(|s| s.files.len()).sum();
+        let files: usize = self.sessions.values().map(|s| s.files.len()).sum::<usize>()
+            + self.remote.values().map(|r| r.shared as usize).sum::<usize>();
         let bytes: u64 = self.sessions.values().map(|s| s.shared_bytes()).sum();
-        format!("{} {} {}", self.sessions.len(), files, bytes / (1 << 30))
+        // remote users report counts, not sizes: estimate 4 MB a song
+        let remote_bytes: u64 = self.remote.values().map(|r| (r.shared as u64 * 4) << 20).sum();
+        format!("{} {} {}", self.sessions.len() + self.remote.len(), files, (bytes + remote_bytes) / (1 << 30))
     }
 
     /// Send to everyone in `channel` except those ignoring `from`.
@@ -179,6 +192,7 @@ impl State {
             let entry = s.channel_entry(&name);
             s.send(Message::new(napster_proto::msg::PART_CHANNEL, name.clone()));
             self.broadcast_channel(&name, None, &Message::new(napster_proto::msg::CHANNEL_PART, entry));
+            self.link_broadcast(&Message::new(crate::link::CHAN_PART, format!("{} {}", name, s.nick)));
         }
         if empty {
             self.channels.remove(channel_key);

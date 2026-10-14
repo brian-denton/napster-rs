@@ -13,6 +13,7 @@ path = "src/main.rs"
 napster-proto.workspace = true
 anyhow.workspace = true
 argon2 = "0.5"
+hmac = "0.12"
 clap.workspace = true
 futures.workspace = true
 rand.workspace = true

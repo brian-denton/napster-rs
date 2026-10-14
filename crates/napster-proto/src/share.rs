@@ -73,13 +73,7 @@ pub struct SearchResult {
 impl SearchResult {
     /// `"<file>" <md5> <size> <bitrate> <freq> <secs> <nick> <ip> <speed>`
     pub fn to_payload(&self) -> String {
-        format!(
-            "{} {} {} {}",
-            self.file.to_share(),
-            self.nick,
-            ip::encode(self.ip),
-            self.link_speed
-        )
+        format!("{} {} {} {}", self.file.to_share(), self.nick, ip::encode(self.ip), self.link_speed)
     }
 
     pub fn parse(s: &str) -> Option<Self> {

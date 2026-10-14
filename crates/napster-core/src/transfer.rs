@@ -145,11 +145,10 @@ pub(crate) async fn push_upload(shared: Arc<Shared>, nick: String, addr: SocketA
     let lib = shared.library();
     let Some(shared_file) = lib.get(&filename) else { return };
     let (path, md5, size) = (shared_file.path.clone(), shared_file.info.md5.clone(), shared_file.info.size);
-    let (id, cancel) =
-        shared.new_transfer(Direction::Upload, &nick, &filename, size, &md5, TransferState::Connecting);
+    let (id, cancel) = shared.new_transfer(Direction::Upload, &nick, &filename, size, &md5, TransferState::Connecting);
     let result: anyhow::Result<()> = async {
         shared.check_peer(addr)?;
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
+        let mut stream = timeout(CONNECT_TIMEOUT, shared.dial_peer(addr)).await??;
         stream.set_nodelay(true)?;
         peer::expect_ack(&mut stream).await?;
         let mut file = File::open(&path).await?;
@@ -244,10 +243,7 @@ fn download_paths(shared: &Shared, filename: &str) -> (PathBuf, PathBuf) {
 }
 
 fn sanitize(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
-        .collect();
+    let s: String = name.chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
     let s = s.trim().trim_matches('.').to_owned();
     if s.is_empty() {
         "download".into()
@@ -263,10 +259,7 @@ fn unique_path(path: &Path) -> PathBuf {
     }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("download");
     let ext = path.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
-    (1..)
-        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .expect("some free name")
+    (1..).map(|n| path.with_file_name(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).expect("some free name")
 }
 
 async fn partial_len(path: &Path) -> u64 {
@@ -280,7 +273,7 @@ pub(crate) async fn download(shared: Arc<Shared>, id: u64, nick: String, addr: S
     shared.update(id, |t| t.state = TransferState::Connecting);
     let result: anyhow::Result<()> = async {
         shared.check_peer(addr)?;
-        let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        let mut stream = match timeout(CONNECT_TIMEOUT, shared.dial_peer(addr)).await {
             Ok(Ok(s)) => s,
             _ => {
                 // tell the server (and through it the uploader)
@@ -447,7 +440,7 @@ async fn receive_data(
 pub(crate) async fn fetch_list(shared: Arc<Shared>, nick: String, addr: SocketAddr) {
     let result: anyhow::Result<()> = async {
         shared.check_peer(addr)?;
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
+        let mut stream = timeout(CONNECT_TIMEOUT, shared.dial_peer(addr)).await??;
         peer::expect_ack(&mut stream).await?;
         stream.write_all(peer::GETLIST).await?;
         stream.flush().await?;
@@ -472,7 +465,7 @@ pub(crate) async fn fetch_list(shared: Arc<Shared>, nick: String, addr: SocketAd
 pub(crate) async fn push_list(shared: Arc<Shared>, addr: SocketAddr) {
     let result: anyhow::Result<()> = async {
         shared.check_peer(addr)?;
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
+        let mut stream = timeout(CONNECT_TIMEOUT, shared.dial_peer(addr)).await??;
         peer::expect_ack(&mut stream).await?;
         let mut out = format!("SENDLIST {}\n", shared.my_nick()).into_bytes();
         let list = peer::encode_list("", &shared.library().infos());

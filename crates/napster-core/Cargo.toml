@@ -25,7 +25,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "socks-proxy"] }
 webpki-roots = "0.26"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

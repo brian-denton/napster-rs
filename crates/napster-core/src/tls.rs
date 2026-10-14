@@ -136,7 +136,12 @@ pub async fn connect(tcp: TcpStream, host: &str, port: u16, known: &mut KnownSer
     let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()?;
     let key = format!("{host}:{port}");
     let seen = Arc::new(Mutex::new(Seen::default()));
-    let verifier = PinningVerifier { webpki, provider: provider.clone(), pinned: known.pins.get(&key).cloned(), seen: seen.clone() };
+    let verifier = PinningVerifier {
+        webpki,
+        provider: provider.clone(),
+        pinned: known.pins.get(&key).cloned(),
+        seen: seen.clone(),
+    };
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()

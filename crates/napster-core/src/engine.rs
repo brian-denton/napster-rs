@@ -53,8 +53,9 @@ pub(crate) struct Shared {
     /// Bandwidth shared by all downloads / all uploads.
     pub down_throttle: Throttle,
     pub up_throttle: Throttle,
-    /// Address of the server we're logged in to.
-    pub server_ip: Mutex<Option<std::net::IpAddr>>,
+    /// Is the server we're logged in to on a local network? (Unknown
+    /// counts as no, e.g. a host name only the proxy resolved.)
+    pub server_local: Mutex<bool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -97,15 +98,22 @@ impl Shared {
     /// LANs), so peers at private addresses are only allowed when the
     /// server itself is local.
     pub fn check_peer(&self, addr: std::net::SocketAddr) -> anyhow::Result<()> {
-        let server = *lock(&self.server_ip);
-        let server_is_local = server.is_none_or(is_local_ip);
-        if !server_is_local && is_local_ip(addr.ip()) {
+        if !*lock(&self.server_local) && is_local_ip(addr.ip()) {
             anyhow::bail!("refusing to connect to private address {} for a server on the internet", addr.ip());
         }
         if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
             anyhow::bail!("refusing to connect to invalid address {addr}");
         }
         Ok(())
+    }
+
+    /// Open a connection to a peer, through the proxy if transfers use it.
+    pub async fn dial_peer(&self, addr: std::net::SocketAddr) -> std::io::Result<TcpStream> {
+        let proxy = self.config().active_proxy().filter(|p| p.transfers).cloned();
+        match proxy {
+            Some(p) => crate::proxy::connect(&p, &addr.ip().to_string(), addr.port()).await,
+            None => TcpStream::connect(addr).await,
+        }
     }
 
     /// Current (download, upload) caps in bytes/second; 0 = unlimited.
@@ -255,7 +263,7 @@ impl Client {
             pending_browses: Mutex::new(HashSet::new()),
             down_throttle: Throttle::default(),
             up_throttle: Throttle::default(),
-            server_ip: Mutex::new(None),
+            server_local: Mutex::new(true),
         });
         tokio::spawn(Actor::new(shared, rx).run());
         (Client { tx }, erx)
@@ -339,6 +347,7 @@ impl Actor {
             }
             Command::Disconnect => self.disconnected("disconnected by user"),
             Command::SetConfig(cfg) => {
+                let cfg = *cfg;
                 let old = std::mem::replace(&mut *lock(&s.config), cfg.clone());
                 if old.shared_dirs != cfg.shared_dirs || old.extensions != cfg.extensions {
                     self.rescan();
@@ -382,14 +391,7 @@ impl Actor {
                 if dup {
                     return;
                 }
-                s.new_transfer(
-                    Direction::Download,
-                    &nick,
-                    &file.filename,
-                    file.size,
-                    &file.md5,
-                    TransferState::Queued,
-                );
+                s.new_transfer(Direction::Download, &nick, &file.filename, file.size, &file.md5, TransferState::Queued);
                 s.pump_downloads();
             }
             Command::CancelTransfer(id) => {
@@ -485,9 +487,10 @@ impl Actor {
             Command::CheckForUpdate { manual } => self.check_update(manual),
             Command::InstallUpdate(info) => {
                 let s = s.clone();
+                let proxy = s.config().active_proxy().cloned();
                 tokio::task::spawn_blocking(move || {
                     let progress = |msg: &str| s.emit(Event::UpdateProgress(msg.to_owned()));
-                    match crate::update::install(&info, progress) {
+                    match crate::update::install(&info, proxy.as_ref(), progress) {
                         Ok(relaunch) => s.emit(Event::UpdateInstalled { version: info.version, relaunch }),
                         Err(e) => s.emit(Event::UpdateFailed(format!("{e:#}"))),
                     }
@@ -498,7 +501,8 @@ impl Actor {
 
     fn check_update(&self, manual: bool) {
         let s = self.shared.clone();
-        tokio::task::spawn_blocking(move || match crate::update::check() {
+        let proxy = s.config().active_proxy().cloned();
+        tokio::task::spawn_blocking(move || match crate::update::check(proxy.as_ref()) {
             Ok(Some(info)) => s.emit(Event::UpdateAvailable(info)),
             Ok(None) if manual => s.emit(Event::UpToDate),
             Ok(None) => {}
@@ -567,9 +571,7 @@ impl Actor {
             }
             Err(e) => {
                 tracing::warn!("bind {want}: {e}");
-                self.shared.emit(Event::Info(format!(
-                    "Unable to bind() to port {want}! Going into firewall mode."
-                )));
+                self.shared.emit(Event::Info(format!("Unable to bind() to port {want}! Going into firewall mode.")));
             }
         }
     }
@@ -587,32 +589,26 @@ impl Actor {
         self.start_listener();
         let port = *lock(&self.shared.data_port);
 
-        let addr = if cfg.use_metaserver {
+        let proxy = cfg.active_proxy();
+        let (host, server_port) = if cfg.use_metaserver {
             self.shared.emit(Event::Status("Finding optimal Server...".into()));
-            resolve_metaserver(&cfg.server).await?
+            resolve_metaserver(&cfg.server, proxy).await?
         } else {
-            self.shared.emit(Event::Status("Resolving Server...".into()));
-            tokio::net::lookup_host(&cfg.server)
-                .await
-                .with_context(|| format!("Unable to resolve Server address {}!", cfg.server))?
-                .next()
-                .ok_or_else(|| anyhow!("Unable to resolve Server address {}!", cfg.server))?
+            split_host_port(&cfg.server)?
         };
-        self.shared.emit(Event::Status("Connecting to Server...".into()));
-        let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| anyhow!("Failed connecting to Server..."))?
-            .context("Failed connecting to Server...")?;
-        tcp.set_nodelay(true)?;
+        self.shared.emit(Event::Status(if proxy.is_some() {
+            "Connecting to Server through proxy...".into()
+        } else {
+            "Connecting to Server...".into()
+        }));
+        let (tcp, server_ip) = dial(proxy, &host, server_port).await.context("Failed connecting to Server...")?;
         let stream: Box<dyn ServerIo> = if cfg.tls {
             if cfg.use_metaserver {
                 bail!("Encrypted connections need a direct server address, not a metaserver.");
             }
-            let host = cfg.server.rsplit_once(':').map(|(h, _)| h).unwrap_or(&cfg.server);
-            let host = host.trim_start_matches('[').trim_end_matches(']');
             let path = cfg.known_servers.clone().unwrap_or_else(crate::tls::KnownServers::default_path);
             let mut known = crate::tls::KnownServers::load(&path);
-            let c = timeout(CONNECT_TIMEOUT, crate::tls::connect(tcp, host, addr.port(), &mut known))
+            let c = timeout(CONNECT_TIMEOUT, crate::tls::connect(tcp, &host, server_port, &mut known))
                 .await
                 .map_err(|_| anyhow!("TLS handshake with the server timed out"))??;
             if let Some(fp) = c.newly_pinned {
@@ -626,7 +622,7 @@ impl Actor {
         } else {
             Box::new(tcp)
         };
-        *lock(&self.shared.server_ip) = Some(addr.ip());
+        *lock(&self.shared.server_local) = server_ip.is_some_and(is_local_ip);
         let mut framed = Framed::new(stream, NapCodec);
         // exactly the b10 login layout: nick pass port "client" speed build flag
         framed
@@ -1022,14 +1018,50 @@ fn channel_user(a: &mut napster_proto::Args<'_>) -> Option<ChannelUser> {
 }
 
 /// Ask a metaserver for a server: it answers `ip:port` or `WAIT <secs>`.
-async fn resolve_metaserver(meta: &str) -> anyhow::Result<SocketAddr> {
+/// `host:port` or `[v6]:port` -> (host, port)
+pub(crate) fn split_host_port(s: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) =
+        s.trim().rsplit_once(':').ok_or_else(|| anyhow!("Server address {s} needs a port (host:port)"))?;
+    let port = port.parse().map_err(|_| anyhow!("Bad port in server address {s}"))?;
+    Ok((host.trim_start_matches('[').trim_end_matches(']').to_owned(), port))
+}
+
+/// Connect directly or through the proxy. Returns the stream and the
+/// server's IP when we know it (the proxy resolves names itself).
+async fn dial(
+    proxy: Option<&crate::proxy::ProxyConfig>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<(TcpStream, Option<std::net::IpAddr>)> {
+    let tcp = match proxy {
+        Some(p) => {
+            let s = timeout(CONNECT_TIMEOUT, crate::proxy::connect(p, host, port))
+                .await
+                .map_err(|_| anyhow!("timed out connecting through the proxy"))??;
+            return Ok((s, host.parse().ok()));
+        }
+        None => {
+            let addr = tokio::net::lookup_host((host, port))
+                .await
+                .with_context(|| format!("Unable to resolve Server address {host}!"))?
+                .next()
+                .ok_or_else(|| anyhow!("Unable to resolve Server address {host}!"))?;
+            let s = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await.map_err(|_| anyhow!("timed out"))??;
+            (s, Some(addr.ip()))
+        }
+    };
+    tcp.0.set_nodelay(true)?;
+    Ok(tcp)
+}
+
+async fn resolve_metaserver(meta: &str, proxy: Option<&crate::proxy::ProxyConfig>) -> anyhow::Result<(String, u16)> {
+    let (meta_host, meta_port) = split_host_port(meta)?;
     for attempt in 0..5 {
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(meta))
-            .await
-            .map_err(|_| anyhow!("Failed finding an optimal Server..."))?
-            .context("Failed opening socket to an optimal Server...")?;
+        let (mut stream, _) =
+            dial(proxy, &meta_host, meta_port).await.context("Failed opening socket to an optimal Server...")?;
         let mut buf = vec![0u8; 99];
-        let n = timeout(CONNECT_TIMEOUT, stream.read(&mut buf)).await.map_err(|_| anyhow!("metaserver timed out"))??;
+        let n =
+            timeout(CONNECT_TIMEOUT, stream.read(&mut buf)).await.map_err(|_| anyhow!("metaserver timed out"))??;
         let reply = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
         if let Some(wait) = reply.strip_prefix("WAIT ") {
             let secs: u64 = wait.trim().parse().unwrap_or(5);
@@ -1037,12 +1069,7 @@ async fn resolve_metaserver(meta: &str) -> anyhow::Result<SocketAddr> {
             tokio::time::sleep(Duration::from_secs(secs.min(60))).await;
             continue;
         }
-        let addr = tokio::net::lookup_host(reply.as_str())
-            .await
-            .with_context(|| format!("Failed resolving an optimal Server... ({reply})"))?
-            .next()
-            .ok_or_else(|| anyhow!("Failed resolving an optimal Server..."))?;
-        return Ok(addr);
+        return split_host_port(&reply).context("Failed resolving an optimal Server...");
     }
     bail!("Server busy, try again later")
 }

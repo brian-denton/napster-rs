@@ -28,6 +28,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 
+use crate::proxy::ProxyConfig;
+
 /// Public half of the release signing key.
 pub const RELEASE_PUBLIC_KEY: &str = "aiFkY0TOpiOanimBRxp9THtriZPc5x7pZ3RsROOptfo=";
 
@@ -99,18 +101,21 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+fn agent(proxy: Option<&ProxyConfig>) -> anyhow::Result<ureq::Agent> {
+    let mut b = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
-        .user_agent(&format!("napster-rs/{}", current_version()))
-        .build()
+        .user_agent(&format!("napster-rs/{}", current_version()));
+    if let Some(p) = proxy {
+        b = b.proxy(ureq::Proxy::new(p.url()).map_err(|e| anyhow!("bad proxy settings: {e}"))?);
+    }
+    Ok(b.build())
 }
 
 /// Is there a newer signed release for this platform?
-pub fn check() -> anyhow::Result<Option<UpdateInfo>> {
+pub fn check(proxy: Option<&ProxyConfig>) -> anyhow::Result<Option<UpdateInfo>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let release: Release = match agent().get(&url).set("Accept", "application/vnd.github+json").call() {
+    let release: Release = match agent(proxy)?.get(&url).set("Accept", "application/vnd.github+json").call() {
         Ok(r) => r.into_json()?,
         // no releases, or the repository isn't public
         Err(ureq::Error::Status(404, _)) => return Ok(None),
@@ -142,19 +147,15 @@ fn choose(release: Release) -> anyhow::Result<Option<UpdateInfo>> {
 
 /// Verify a base64 Ed25519 signature over `data`.
 pub fn verify(data: &[u8], sig_b64: &str, public_key_b64: &str) -> anyhow::Result<()> {
-    let pk: [u8; 32] = B64
-        .decode(public_key_b64.trim())?
-        .try_into()
-        .map_err(|_| anyhow!("bad public key length"))?;
-    let sig: [u8; 64] =
-        B64.decode(sig_b64.trim())?.try_into().map_err(|_| anyhow!("bad signature length"))?;
+    let pk: [u8; 32] = B64.decode(public_key_b64.trim())?.try_into().map_err(|_| anyhow!("bad public key length"))?;
+    let sig: [u8; 64] = B64.decode(sig_b64.trim())?.try_into().map_err(|_| anyhow!("bad signature length"))?;
     VerifyingKey::from_bytes(&pk)?
         .verify(data, &Signature::from_bytes(&sig))
         .map_err(|_| anyhow!("the update's signature is not valid; refusing to install it"))
 }
 
-fn download(url: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = agent().get(url).call().map_err(|e| anyhow!("downloading {url}: {e}"))?;
+fn download(url: &str, proxy: Option<&ProxyConfig>) -> anyhow::Result<Vec<u8>> {
+    let resp = agent(proxy)?.get(url).call().map_err(|e| anyhow!("downloading {url}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader().take(MAX_DOWNLOAD + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_DOWNLOAD {
@@ -165,10 +166,14 @@ fn download(url: &str) -> anyhow::Result<Vec<u8>> {
 
 /// Download, verify and install `info`. Returns what to launch to run
 /// the new version (an executable, or a `.app` bundle on macOS).
-pub fn install(info: &UpdateInfo, mut progress: impl FnMut(&str)) -> anyhow::Result<PathBuf> {
+pub fn install(
+    info: &UpdateInfo,
+    proxy: Option<&ProxyConfig>,
+    mut progress: impl FnMut(&str),
+) -> anyhow::Result<PathBuf> {
     progress(&format!("Downloading {}...", info.asset_name));
-    let data = download(&info.asset_url)?;
-    let sig = String::from_utf8(download(&info.sig_url)?).context("signature isn't text")?;
+    let data = download(&info.asset_url, proxy)?;
+    let sig = String::from_utf8(download(&info.sig_url, proxy)?).context("signature isn't text")?;
     progress("Verifying signature...");
     verify(&data, &sig, RELEASE_PUBLIC_KEY)?;
     progress("Installing...");

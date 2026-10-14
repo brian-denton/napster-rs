@@ -21,6 +21,7 @@ use crate::state::{Channel, Level, Session, State};
 use crate::{Shared, VERSION};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+const LINGER: Duration = Duration::from_secs(2);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Serve one connection (plain TCP or TLS). `_slot` holds this address's
@@ -67,6 +68,11 @@ where
     conn.cleanup();
     drop(conn);
     let _ = writer_task.await;
+    // Lingering close: the writer has flushed and sent FIN. If we closed now
+    // with unread input (a flooder, say), the OS would reset the connection
+    // and Windows clients would lose our final messages, so read and
+    // discard for a moment first.
+    let _ = tokio::time::timeout(LINGER, async { while let Some(Ok(_)) = reader.next().await {} }).await;
     tracing::debug!("{peer}: disconnected");
     result
 }
@@ -252,6 +258,12 @@ impl Conn {
         }
         let existing = {
             let st = self.shared.lock();
+            if let Some(r) = st.remote_user(&nick) {
+                let server = r.server.clone();
+                drop(st);
+                self.reply(msg::ERROR, format!("{nick} is already logged in on server {server}."));
+                return false;
+            }
             if let Some(ban) = st.db.banned(&nick, &self.ip.to_string()) {
                 let reason = ban.reason.clone();
                 drop(st);
@@ -357,6 +369,8 @@ impl Conn {
             connected: Instant::now(),
             muzzled: false,
             cloaked: false,
+            login_ms: crate::link::now_ms(),
+            announced_shares: 0,
         };
         st.sessions.insert(key.clone(), session);
         self.nick = Some(acc.nick.clone());
@@ -366,6 +380,7 @@ impl Conn {
             self.reply(msg::MOTD, line.clone());
         }
         self.reply(msg::SERVER_STATS, st.stats());
+        st.announce_user(&acc.nick);
         let signon = Message::new(msg::USER_SIGNON, format!("{} {}", acc.nick, speed));
         for s in st.sessions.values() {
             if s.hotlist.contains(&key) {
@@ -392,6 +407,7 @@ impl Conn {
             st.part_channel(&nick, &ch);
         }
         st.sessions.remove(&key);
+        st.link_broadcast(&Message::new(crate::link::USER_OFF, nick.clone()));
         let signoff = Message::new(msg::USER_SIGNOFF, nick.clone());
         for s in st.sessions.values() {
             if s.hotlist.contains(&key) {
@@ -480,7 +496,12 @@ impl Conn {
             msg::CLEAR_CHANNEL => self.clear_channel(&m),
             msg::LINK_SPEED_REQUEST => {
                 let target = m.data.trim();
-                let reply = self.shared.lock().session(target).map(|s| format!("{} {}", s.nick, s.link_speed));
+                let st = self.shared.lock();
+                let reply = st
+                    .session(target)
+                    .map(|s| format!("{} {}", s.nick, s.link_speed))
+                    .or_else(|| st.remote_user(target).map(|r| format!("{} {}", r.nick, r.speed)));
+                drop(st);
                 match reply {
                     Some(r) => self.reply(msg::LINK_SPEED, r),
                     None => self.error(format!("User {target} is not currently online.")),
@@ -622,7 +643,7 @@ impl Conn {
         let words = q.words();
         let max = q.max_results.min(self.shared.config.max_results) as usize;
         let me = self.key();
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
         let mut n = 0;
         'outer: for (k, s) in &st.sessions {
             if *k == me {
@@ -639,9 +660,14 @@ impl Conn {
                 }
             }
         }
+        // other servers finish the search (and send 202) if linked
+        let remaining = max.saturating_sub(n);
+        let fanned = !q.local_only && crate::link::start_search(&self.shared, &mut st, self.nick(), remaining, &m.data);
         drop(st);
-        self.reply(msg::SEARCH_END, "");
-        tracing::debug!("{}: search {:?} -> {n} results", self.nick(), q.terms);
+        if !fanned {
+            self.reply(msg::SEARCH_END, "");
+        }
+        tracing::debug!("{}: search {:?} -> {n} local results", self.nick(), q.terms);
     }
 
     fn resume_request(&self, m: &Message) {
@@ -683,14 +709,14 @@ impl Conn {
         let target = a.str().unwrap_or("").to_owned();
         let file = a.str().unwrap_or("").to_owned();
         let st = self.shared.lock();
+        if st.forward(&target, self.nick(), m) {
+            return;
+        }
         let me = st.session(self.nick());
         let up = st.session(&target);
         match (me, up) {
             (Some(me), Some(up)) if up.files.iter().any(|f| f.filename == file) => {
-                up.send(Message::new(
-                    msg::UPLOAD_REQUEST,
-                    format!("{} {} {}", me.nick, quote(&file), me.link_speed),
-                ));
+                up.send(Message::new(msg::UPLOAD_REQUEST, format!("{} {} {}", me.nick, quote(&file), me.link_speed)));
             }
             _ => self.reply(msg::DOWNLOAD_ERROR, format!("{} {}", target, quote(&file))),
         }
@@ -702,23 +728,26 @@ impl Conn {
         let downloader = a.str().unwrap_or("").to_owned();
         let file = a.str().unwrap_or("").to_owned();
         let st = self.shared.lock();
-        let (Some(me), Some(down)) = (st.session(self.nick()), st.session(&downloader)) else { return };
+        let Some(me) = st.session(self.nick()) else { return };
         let Some(f) = me.files.iter().find(|f| f.filename == file) else {
-            down.send(Message::new(msg::DOWNLOAD_ERROR, format!("{} {}", me.nick, quote(&file))));
+            st.deliver(&downloader, Message::new(msg::DOWNLOAD_ERROR, format!("{} {}", me.nick, quote(&file))));
             return;
         };
-        down.send(Message::new(
-            msg::DOWNLOAD_ACK,
-            format!(
-                "{} {} {} {} {} {}",
-                me.nick,
-                ip::encode(me.ip),
-                me.data_port,
-                quote(&f.filename),
-                f.md5,
-                me.link_speed
+        st.deliver(
+            &downloader,
+            Message::new(
+                msg::DOWNLOAD_ACK,
+                format!(
+                    "{} {} {} {} {} {}",
+                    me.nick,
+                    ip::encode(me.ip),
+                    me.data_port,
+                    quote(&f.filename),
+                    f.md5,
+                    me.link_speed
+                ),
             ),
-        ));
+        );
     }
 
     /// 500 `<uploader> "<file>"`: the uploader is firewalled, ask them to
@@ -728,6 +757,9 @@ impl Conn {
         let target = a.str().unwrap_or("").to_owned();
         let file = a.str().unwrap_or("").to_owned();
         let st = self.shared.lock();
+        if st.forward(&target, self.nick(), m) {
+            return;
+        }
         let (Some(me), Some(up)) = (st.session(self.nick()), st.session(&target)) else {
             self.reply(msg::DOWNLOAD_ERROR, format!("{} {}", target, quote(&file)));
             return;
@@ -737,10 +769,7 @@ impl Conn {
             return;
         };
         if me.data_port == 0 {
-            self.error(format!(
-                "Unable to download from {}: you are both behind firewalls (data port 0).",
-                up.nick
-            ));
+            self.error(format!("Unable to download from {}: you are both behind firewalls (data port 0).", up.nick));
             return;
         }
         up.send(Message::new(
@@ -766,7 +795,7 @@ impl Conn {
         let st = self.shared.lock();
         let Some(me) = st.session(self.nick()) else { return };
         let size = me.files.iter().find(|f| f.filename == file).map(|f| f.size).unwrap_or(0);
-        st.send(
+        st.deliver(
             &downloader,
             Message::new(msg::QUEUE_LIMIT_NOTIFY, format!("{} {} {} {}", me.nick, quote(&file), size, limit)),
         );
@@ -779,6 +808,9 @@ impl Conn {
         let st = self.shared.lock();
         if let Some(up) = st.session(&target) {
             up.send(Message::new(msg::DATA_PORT_ERROR, format!("{} {}", self.nick(), up.data_port)));
+        } else if let Some(r) = st.remote_user(&target) {
+            let port = r.data_port;
+            st.deliver(&target, Message::new(msg::DATA_PORT_ERROR, format!("{} {port}", self.nick())));
         }
     }
 
@@ -787,6 +819,9 @@ impl Conn {
     fn browse(&self, m: &Message) {
         let target = m.args().str().unwrap_or("").to_owned();
         let st = self.shared.lock();
+        if st.forward(&target, self.nick(), m) {
+            return;
+        }
         match st.session(&target) {
             Some(s) => {
                 for f in &s.files {
@@ -802,6 +837,9 @@ impl Conn {
     fn direct_browse(&self, m: &Message) {
         let target = m.args().str().unwrap_or("").to_owned();
         let st = self.shared.lock();
+        if st.forward(&target, self.nick(), m) {
+            return;
+        }
         let Some(me) = st.session(self.nick()) else { return };
         let fail = |why: &str| {
             self.reply(msg::DIRECT_BROWSE_ERROR, format!("{} {}", target, quote(why)));
@@ -827,12 +865,9 @@ impl Conn {
         let st = self.shared.lock();
         let Some(me) = st.session(self.nick()) else { return };
         if me.data_port != 0 {
-            st.send(
+            st.deliver(
                 &requester,
-                Message::new(
-                    msg::DIRECT_BROWSE_ACCEPT,
-                    format!("{} {} {}", me.nick, ip::encode(me.ip), me.data_port),
-                ),
+                Message::new(msg::DIRECT_BROWSE_ACCEPT, format!("{} {} {}", me.nick, ip::encode(me.ip), me.data_port)),
             );
         }
     }
@@ -849,6 +884,9 @@ impl Conn {
                 if !t.ignored.contains(&self.key()) {
                     t.send(Message::new(msg::PRIVATE_MESSAGE, format!("{} {}", self.nick(), text)));
                 }
+            }
+            None if st.remote_user(&target).is_some() => {
+                st.deliver(&target, Message::new(msg::PRIVATE_MESSAGE, format!("{} {}", self.nick(), text)));
             }
             _ => self.error(format!("User {target} is not currently online.")),
         }
@@ -872,6 +910,8 @@ impl Conn {
         self.reply(msg::HOTLIST_ACK, target.clone());
         if let Some(t) = st.session(&target).filter(|t| !t.cloaked) {
             self.reply(msg::USER_SIGNON, format!("{} {}", t.nick, t.link_speed));
+        } else if let Some(r) = st.remote_user(&target) {
+            self.reply(msg::USER_SIGNON, format!("{} {}", r.nick, r.speed));
         }
     }
 
@@ -927,6 +967,30 @@ impl Conn {
                 }
                 self.reply(msg::WHOIS_RESPONSE, out);
             }
+            None if st.remote_user(&target).is_some() => {
+                let r = st.remote_user(&target).unwrap();
+                let channels: Vec<&str> = st
+                    .channels
+                    .values()
+                    .filter(|c| c.members.contains(&target.to_lowercase()))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                let mut out = format!(
+                    "{} {} {} {} {} {} 0 0 {} {}",
+                    r.nick,
+                    quote(r.level.as_str()),
+                    crate::link::now_ms().saturating_sub(r.login_ms) / 1000,
+                    quote(&channels.join(" ")),
+                    quote("Remote"),
+                    r.shared,
+                    r.speed,
+                    quote(&r.client)
+                );
+                if my_level >= Level::Moderator {
+                    out.push_str(&format!(" 0 0 {} 0 {} {}", r.ip, r.data_port, r.server));
+                }
+                self.reply(msg::WHOIS_RESPONSE, out);
+            }
             _ => match st.db.get(&target) {
                 Some(acc) => {
                     self.reply(msg::WHOWAS, format!("{} {} {}", acc.nick, quote(acc.level.as_str()), acc.last_seen))
@@ -939,7 +1003,7 @@ impl Conn {
     fn relay_ping(&self, m: &Message, kind: u16) {
         let target = m.args().str().unwrap_or("").to_owned();
         let st = self.shared.lock();
-        if !st.send(&target, Message::new(kind, self.nick().to_owned())) && kind == msg::PING {
+        if !st.deliver(&target, Message::new(kind, self.nick().to_owned())) && kind == msg::PING {
             self.error(format!("ping failed, {target} is not online"));
         }
     }
@@ -1018,10 +1082,11 @@ impl Conn {
         }
         self.reply(msg::JOIN_ACK, ch_name.clone());
         for mk in &members {
-            if let Some(s) = st.sessions.get(mk) {
-                self.reply(msg::CHANNEL_USER, s.channel_entry(&ch_name));
+            if let Some(entry) = st.channel_entry_for(mk, &ch_name) {
+                self.reply(msg::CHANNEL_USER, entry);
             }
         }
+        st.link_broadcast(&Message::new(crate::link::CHAN_JOIN, format!("{} {}", ch_name, self.nick())));
         self.reply(msg::CHANNEL_USER_END, ch_name.clone());
         self.reply(msg::CHANNEL_TOPIC, format!("{ch_name} {topic}"));
         let me = &st.sessions[&me_key];
@@ -1056,6 +1121,7 @@ impl Conn {
             Some(self.nick()),
             &Message::new(msg::CHANNEL_MESSAGE, format!("{} {} {}", name, self.nick(), text)),
         );
+        st.link_broadcast(&Message::new(crate::link::CHAN_SAY, format!("{} {} {}", name, self.nick(), text)));
     }
 
     fn emote(&self, m: &Message) {
@@ -1075,6 +1141,7 @@ impl Conn {
             Some(self.nick()),
             &Message::new(msg::EMOTE, format!("{} {} {}", name, self.nick(), quote(&text))),
         );
+        st.link_broadcast(&Message::new(crate::link::CHAN_EMOTE, format!("{} {} {}", name, self.nick(), quote(&text))));
     }
 
     fn topic(&self, m: &Message) {
@@ -1097,7 +1164,9 @@ impl Conn {
         ch.topic = topic;
         let out = Message::new(msg::CHANNEL_TOPIC, format!("{} {}", ch.name, ch.topic));
         let name = ch.name.clone();
+        let synced = Message::new(crate::link::CHAN_TOPIC, format!("{} {}", ch.name, ch.topic));
         st.broadcast_channel(&name, None, &out);
+        st.link_broadcast(&synced);
     }
 
     fn list_channels(&self) {
@@ -1134,8 +1203,8 @@ impl Conn {
             return self.error(format!("Channel {channel} does not exist!"));
         };
         for mk in &ch.members {
-            if let Some(s) = st.sessions.get(mk) {
-                self.reply(msg::CHANNEL_USER_ENTRY, s.channel_entry(&ch.name));
+            if let Some(entry) = st.channel_entry_for(mk, &ch.name) {
+                self.reply(msg::CHANNEL_USER_ENTRY, entry);
             }
         }
         self.reply(msg::LIST_CHANNEL_USERS, ch.name.clone());
@@ -1151,7 +1220,7 @@ impl Conn {
         };
         let ch = &st.channels[&key];
         let text = format!("{} {} {} 0 Hello!", self.nick(), ch.name, quote(&ch.topic));
-        if !st.send(&target, Message::new(msg::CHANNEL_INVITE, text)) {
+        if !st.deliver(&target, Message::new(msg::CHANNEL_INVITE, text)) {
             self.error(format!("User {target} is not currently online."));
         }
     }
@@ -1179,10 +1248,7 @@ impl Conn {
         let st = self.shared.lock();
         if let Some(ch) = st.channels.get(&channel.to_lowercase()) {
             for b in &ch.bans {
-                self.reply(
-                    msg::CHANNEL_BAN_ENTRY,
-                    format!("{} {} {} {}", b.target, b.by, quote(&b.reason), b.when),
-                );
+                self.reply(msg::CHANNEL_BAN_ENTRY, format!("{} {} {} {}", b.target, b.by, quote(&b.reason), b.when));
             }
         }
         self.reply(msg::CHANNEL_BAN_LIST, channel);
@@ -1238,11 +1304,8 @@ impl Conn {
     /// (Elite can act on anyone).
     fn outranks(&self, st: &State, target: &str) -> bool {
         let mine = self.my_level_locked(st);
-        let theirs = st
-            .session(target)
-            .map(|s| s.level)
-            .or_else(|| st.db.get(target).map(|a| a.level))
-            .unwrap_or(Level::Leech);
+        let theirs =
+            st.session(target).map(|s| s.level).or_else(|| st.db.get(target).map(|a| a.level)).unwrap_or(Level::Leech);
         mine == Level::Elite || mine > theirs
     }
 

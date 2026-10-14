@@ -3,6 +3,7 @@
 
 pub mod db;
 mod guard;
+pub mod link;
 mod session;
 pub mod state;
 pub mod tls;
@@ -64,6 +65,14 @@ pub struct Config {
     pub msg_rate: f64,
     /// Burst of messages allowed above `msg_rate`.
     pub msg_burst: f64,
+    /// This server's name on a linked network; must be unique per server.
+    pub server_name: String,
+    /// Where to accept links from other servers.
+    pub link_listen: Option<SocketAddr>,
+    /// Servers to link to.
+    pub links: Vec<link::LinkPeer>,
+    /// Shared secret all linked servers use to authenticate each other.
+    pub link_password: Option<String>,
 }
 
 impl Default for Config {
@@ -73,10 +82,7 @@ impl Default for Config {
             meta_listen: Some(([0, 0, 0, 0], napster_proto::METASERVER_PORT).into()),
             public_host: None,
             data_dir: None,
-            motd: vec![
-                format!("Welcome to {VERSION}."),
-                "This server speaks the Napster 2.0 protocol.".into(),
-            ],
+            motd: vec![format!("Welcome to {VERSION}."), "This server speaks the Napster 2.0 protocol.".into()],
             channels: [
                 "Lobby",
                 "Help",
@@ -106,6 +112,10 @@ impl Default for Config {
             max_user_channels: 500,
             msg_rate: 20.0,
             msg_burst: 200.0,
+            server_name: "napd".into(),
+            link_listen: None,
+            links: vec![],
+            link_password: None,
         }
     }
 }
@@ -132,14 +142,13 @@ pub struct Server {
     meta: Option<TcpListener>,
     tls: Option<(TcpListener, TlsAcceptor)>,
     tls_fingerprint: Option<String>,
+    link: Option<(TcpListener, TlsAcceptor)>,
     shared: Arc<Shared>,
 }
 
 impl Server {
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(config.listen)
-            .await
-            .with_context(|| format!("binding {}", config.listen))?;
+        let listener = TcpListener::bind(config.listen).await.with_context(|| format!("binding {}", config.listen))?;
         let meta = match config.meta_listen {
             Some(addr) => Some(TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?),
             None => None,
@@ -147,18 +156,34 @@ impl Server {
         if let Some(dir) = &config.data_dir {
             std::fs::create_dir_all(dir)?;
         }
-        let (tls, tls_fingerprint) = match config.tls_listen {
-            Some(addr) => {
-                let setup = tls::setup(
-                    config.tls_cert.as_deref(),
-                    config.tls_key.as_deref(),
-                    config.data_dir.as_deref(),
-                    config.public_host.as_deref(),
-                )?;
-                let l = TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
-                (Some((l, TlsAcceptor::from(setup.config))), Some(setup.fingerprint))
+        let linking = config.link_listen.is_some() || !config.links.is_empty();
+        if linking && config.link_password.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("linking servers needs --link-password");
+        }
+        // one certificate serves both the client TLS port and links
+        let setup = if config.tls_listen.is_some() || linking {
+            Some(tls::setup(
+                config.tls_cert.as_deref(),
+                config.tls_key.as_deref(),
+                config.data_dir.as_deref(),
+                config.public_host.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let acceptor = setup.as_ref().map(|s| TlsAcceptor::from(s.config.clone()));
+        let tls_fingerprint = setup.map(|s| s.fingerprint);
+        let tls = match (config.tls_listen, &acceptor) {
+            (Some(addr), Some(a)) => {
+                Some((TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?, a.clone()))
             }
-            None => (None, None),
+            _ => None,
+        };
+        let link = match (config.link_listen, &acceptor) {
+            (Some(addr), Some(a)) => {
+                Some((TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?, a.clone()))
+            }
+            _ => None,
         };
         let db = Db::load(config.data_dir.as_ref().map(|d| d.join("db.json")))?;
         let mut state = State { db, ..Default::default() };
@@ -166,7 +191,12 @@ impl Server {
             state.channels.insert(name.to_lowercase(), Channel::new(name, true));
         }
         let shared = Arc::new(Shared { config, state: Mutex::new(state), guard: Mutex::default() });
-        Ok(Self { listener, meta, tls, tls_fingerprint, shared })
+        Ok(Self { listener, meta, tls, tls_fingerprint, link, shared })
+    }
+
+    /// Address accepting links from other servers, if enabled.
+    pub fn link_addr(&self) -> Option<SocketAddr> {
+        self.link.as_ref().map(|(l, _)| l.local_addr().expect("bound"))
     }
 
     /// Address of the TLS port, if enabled.
@@ -195,6 +225,21 @@ impl Server {
             tokio::spawn(run_metaserver(meta, public_host, port));
         }
         tokio::spawn(stats_loop(self.shared.clone()));
+        if let Some((listener, acceptor)) = self.link {
+            tracing::info!(
+                "accepting links as \"{}\" on {} (certificate SHA-256 {})",
+                self.shared.config.server_name,
+                listener.local_addr()?,
+                self.tls_fingerprint.as_deref().unwrap_or("?")
+            );
+            tokio::spawn(link::accept_loop(self.shared.clone(), listener, acceptor));
+        }
+        for peer in self.shared.config.links.clone() {
+            tokio::spawn(link::connect_loop(self.shared.clone(), peer));
+        }
+        if self.shared.config.link_listen.is_some() || !self.shared.config.links.is_empty() {
+            tokio::spawn(link::share_sync_loop(self.shared.clone()));
+        }
         if let Some((listener, acceptor)) = self.tls {
             tracing::info!(
                 "TLS listening on {} (certificate SHA-256 {})",

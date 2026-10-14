@@ -4,6 +4,7 @@
 
 mod app;
 mod classic;
+mod player;
 mod snapshot;
 
 use std::path::PathBuf;
@@ -33,10 +34,6 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native(
-        "Napster",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, config_path)))),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    eframe::run_native("Napster", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, config_path)))))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }

@@ -166,6 +166,43 @@ sync after any ID3v2 tag. WMA files send the literal `WMA-FILE`.
 * The client string is `napster-rs <version>`. The login layout is the same
   as b10's.
 
+## Server links (napster-rs extension)
+
+`napd` servers can join into one network. Links are napster-rs's own
+design, not compatible with OpenNap's linking. They run over TLS, and the
+connecting server pins the peer's certificate fingerprint. Messages use
+the normal frame format, with types from 10000 up:
+
+| Type | Name | Payload |
+|---|---|---|
+| 10000 | HELLO | `<server-name> <nonce>` |
+| 10001 | AUTH | hex HMAC-SHA256(link password, `napster-link\|<peer's nonce>\|<own name>`) |
+| 10010 | USER_ON | `<nick> <ip> <data-port> <speed> <shared> <level> <login-ms> "<client>"` |
+| 10011 | USER_OFF | `<nick>` |
+| 10012 | USER_SHARES | `<nick> <count>` |
+| 10020 | DELIVER | `<to-nick> <type> <data>`: hand a client message to a local user |
+| 10021 | FORWARD | `<from-nick> <type> <data>`: a remote user's 203/500/211/640 about a local user |
+| 10030 | SEARCH | `<id> <max> <200 payload>` |
+| 10031 | SEARCH_RESULT | `<id> <201 payload>` |
+| 10032 | SEARCH_END | `<id>` |
+| 10040–10044 | CHAN_JOIN / PART / SAY / EMOTE / TOPIC | `<channel> <nick> [text]`, or `<channel> <topic>` for TOPIC |
+
+The handshake:
+
+1. The accepting server sends HELLO.
+2. The connecting server answers with its own HELLO, then AUTH.
+3. The accepting server checks that AUTH and replies with its own AUTH,
+   which the connecting server checks.
+
+After that, each server sends USER_ON for its users and CHAN_JOIN for its
+channel members.
+
+The network is a full mesh: nothing is relayed between servers.
+
+If two servers accept the same nick at the same moment, the earlier login
+wins. Ties go to the alphabetically lower server name. Both servers apply
+the same rule, so they agree on who keeps the nick.
+
 ## References
 
 * *napster messages* by drscholl (OpenNap):

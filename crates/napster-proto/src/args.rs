@@ -81,9 +81,7 @@ mod tests {
 
     #[test]
     fn splits_quoted() {
-        let mut a = Args::new(
-            "\"random band - random song.mp3\" 7d733c1e 2558199 128 44100 159 lefty 3437166285 4",
-        );
+        let mut a = Args::new("\"random band - random song.mp3\" 7d733c1e 2558199 128 44100 159 lefty 3437166285 4");
         assert_eq!(a.str(), Some("random band - random song.mp3"));
         assert_eq!(a.str(), Some("7d733c1e"));
         assert_eq!(a.num::<u64>(), Some(2558199));

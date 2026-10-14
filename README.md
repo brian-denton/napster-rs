@@ -14,10 +14,11 @@ gray, bevelled buttons, the tab row, and the Search and Transfer windows.
 | Crate | Binary | What it is |
 |---|---|---|
 | `napster-proto` | | Wire protocol: frame codec, message numbers, field tokenizer, search grammar, and the peer `GET`/`SEND`/`GETLIST` handshakes |
-| `napster-server` | `napd` | Server and metaserver: accounts, sharing and search, transfer brokering (including firewalled push), chat rooms, hot lists, whois, and moderation |
-| `napster-core` | | Client engine: login, library scan (MP3 parsing and Napster MD5), downloads and uploads with resume, push transfers, direct browse |
-| `napster-gui` | `napster` | Desktop client (egui) with the original's tabs: Home, Chat, Library, Search, Hot List, Transfer and Discover |
+| `napster-server` | `napd` | Server and metaserver: accounts, sharing and search, transfer brokering (including firewalled push), chat rooms, hot lists, whois, moderation, TLS, and linking servers into one network |
+| `napster-core` | | Client engine: login (plain, TLS or via SOCKS5), library scan (MP3 parsing and Napster MD5), downloads and uploads with resume, push transfers, direct browse, period-accurate speeds, signed self-update |
+| `napster-gui` | `napster` | Desktop client (egui) with the original's tabs: Home, Chat, Library and player, Search, Hot List, Transfer, Discover and Help |
 | `napster-cli` | `napster-cli` | Line-based client over the same engine |
+| `napster-sign` | `napster-sign` | Signs release packages for auto-update (used by CI) |
 
 ## Build
 
@@ -75,9 +76,61 @@ napd --elite yourname
   day.
 * `--max-conns-per-ip` (default 8) and `--max-shares` (default 20,000)
   adjust the abuse limits. See [Security](#security).
+* Several servers can be linked into one network. See
+  [Linking servers](#linking-servers).
 
 People outside your LAN need to reach port 8889 (and 8888 for 2001
 clients), plus 8875 if they use the metaserver.
+
+### Linking servers
+
+Like OpenNap networks of the era, several `napd` servers can join into one
+network. A user on any server can then:
+
+* search all the servers at once;
+* download and browse from users on other servers, including firewalled
+  ones;
+* send private messages and pings, and look users up with whois;
+* chat in shared channels;
+* see users on other servers come and go on their hot list.
+
+Nicks are unique across the whole network. Accounts, bans and moderation
+stay with each server.
+
+Every server links directly to every other one (a full mesh); nothing is
+relayed through a middle server. For three servers A, B and C:
+
+```bash
+# A accepts links; it prints its certificate fingerprint at startup
+napd --server-name alpha --link-listen 0.0.0.0:8890 --link-password "long shared secret"
+
+# B links to A, and accepts a link from C
+napd --server-name beta --link-listen 0.0.0.0:8890 --link-password "long shared secret" \
+     --link a.example.org:8890=<A's fingerprint>
+
+# C links to A and B
+napd --server-name gamma --link-password "long shared secret" \
+     --link a.example.org:8890=<A's fingerprint> --link b.example.org:8890=<B's fingerprint>
+```
+
+* **Names:** each server needs a unique `--server-name`.
+* **Fingerprints:** `--link host:port=FINGERPRINT` takes the fingerprint
+  the other server logs at startup.
+* **Password:** `--link-password` must be the same everywhere. You can set
+  it in the `NAPD_LINK_PASSWORD` environment variable instead of on the
+  command line.
+
+How links are secured:
+
+* **Encrypted:** links run over TLS.
+* **Pinned:** each server accepts only the exact certificate fingerprint
+  you configured for its peer, so it can't be tricked into talking to an
+  impostor.
+* **Authenticated:** both servers prove they know the link password with
+  an HMAC challenge, so the password itself never crosses the network.
+
+A dropped link reconnects every 10 seconds. While it's down, users on the
+other side simply disappear from searches and channels.
 
 ## Run the client
 
@@ -97,6 +150,22 @@ Preferences and use the server's TLS port, `host:8889`. On the CLI, pass
 certificate. If the certificate ever changes, the client refuses to
 connect and warns that someone may be impersonating the server.
 
+If you have to go through a SOCKS5 proxy, fill in **Firewall Settings**
+in Preferences:
+
+* **Server and login:** the proxy's server, port and, if it needs one, a
+  user name and password.
+* **What goes through it:** the server connection, the metaserver lookup
+  and the update check always do. File transfers do too unless you
+  untick **Also send file transfers through the proxy**.
+* **Your DNS lookups:** host names are resolved by the proxy, not your own
+  computer.
+* **Incoming connections:** other users can't reach you through a proxy,
+  so if nothing can connect to you directly, set the data port to `0`.
+
+On the CLI, use `--proxy host:port`, plus `--proxy-user` and
+`--proxy-password` if the proxy needs them.
+
 Settings are stored in `%APPDATA%\napster-rs\config.json`, which is shared
 with the CLI. Remembered server certificates are in `known_servers.json`
 in the same folder.
@@ -104,6 +173,21 @@ in the same folder.
 Chat boxes accept IRC-style commands such as `/join`, `/msg`, `/me`,
 `/whois`, `/browse`, `/ping` and `/raw <numeric> <data>`. Type `/help` for
 the full list.
+
+### The player
+
+The **Library** tab doubles as the original's "My Files & Player":
+
+* **Playing:** double-click a song in My Files (or right-click it and
+  choose **Add to Playlist**) to queue it in the playlist on the right.
+* **Controls:** the bar underneath has previous, play, pause, stop and
+  next buttons, a green LCD-style display showing the song and time, and
+  seek and volume sliders. Songs play through in order.
+* **Playlists:** **Load Playlist...** and **Save Playlist...** read and
+  write M3U and PLS files.
+* **Finished downloads:** double-click one in the Transfer tab to play it.
+* **Formats:** MP3, WAV, FLAC and Ogg Vorbis. The original played WMA
+  through Windows Media; that isn't supported.
 
 ### CLI
 
@@ -184,8 +268,10 @@ the original binary.
 cargo test --workspace
 ```
 
-The end-to-end tests in `crates/napster-core/tests/e2e.rs` start a real
-`napd` and real client engines on loopback. They cover:
+The end-to-end tests in `crates/napster-core/tests/` start real `napd`
+servers and real client engines on loopback.
+
+`e2e.rs` covers:
 
 * search and download, checked byte for byte
 * a firewalled uploader pushing a file
@@ -193,6 +279,25 @@ The end-to-end tests in `crates/napster-core/tests/e2e.rs` start a real
 * direct browse, normal and firewalled
 * chat, private messages and hot-list notifications
 * login through the metaserver, including a wrong password
+* download speed caps and period-accurate line speeds
+
+`security.rs` covers:
+
+* TLS certificate pinning and impersonation detection
+* failed-login lockout and the sign-up limit
+* connection, flood and share limits
+* refusing non-audio downloads
+
+`proxy.rs` covers logging in, searching and downloading through a SOCKS5
+proxy that requires a password.
+
+`linking.rs` covers two linked servers:
+
+* searching, downloading and browsing across servers
+* private messages, pings and whois
+* shared channels and hot lists
+* unique nicks across the network
+* refusing a server with the wrong link password or certificate
 
 ### Automatic updates
 
@@ -261,6 +366,9 @@ napster-rs adds, and what it can't fix.
   hour.
 * **Connection limits:** at most 8 connections per address, and 5,000 in
   total.
+* **Server links:** links between servers use TLS with pinned
+  certificates and HMAC authentication. See
+  [Linking servers](#linking-servers).
 * **Flood protection:** each connection may send 20 messages a second, with
   bursts up to 200. File-sharing messages are exempt. Excess messages are
   dropped, and persistent flooders are disconnected.
@@ -298,12 +406,16 @@ napster-rs adds, and what it can't fix.
 * **The 2001 client can't use TLS.** If you don't need it, run `napd` with
   `--listen 127.0.0.1:8888` to keep the unencrypted port local.
 * **A server operator can see everything** that passes through their
-  server, encrypted or not.
+  server, encrypted or not. On a linked network, that includes every
+  server in the network.
 
-## Not implemented
+## Deliberately left out
 
-* The built-in MP3 player.
-* Proxy (SOCKS) support.
-* Server-to-server linking.
-* Auto-upgrade (message 5) and the connection tests (900/901), which are
-  ignored on purpose. See the protocol notes.
+* **Auto-upgrade (message 5).** It made the 2001 client download and run
+  any program a server pointed it to. napster-rs updates itself only from
+  signed GitHub releases, and only after you agree (see
+  [Automatic updates](#automatic-updates)).
+* **Connection tests (messages 900/901).** They let a server make clients
+  open connections, or listen on ports, of the server's choosing.
+* **WMA playback.** It needs Windows Media; WMA files can still be shared
+  and downloaded.
