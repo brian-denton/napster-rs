@@ -1,0 +1,148 @@
+# Test on every push/PR; build Windows, macOS (universal .app) and Linux
+# packages as downloadable artifacts. Pushing a tag like v0.1.0 also
+# publishes them as a GitHub release.
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Linux system libraries for eframe (winit/glow) and rfd (GTK3 dialogs)
+  LINUX_DEPS: >-
+    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+    libgtk-3-dev libgl1-mesa-dev
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/napster-rs | Out-Null
+          Copy-Item target/release/napster.exe, target/release/napster-cli.exe, target/release/napd.exe, README.md dist/napster-rs/
+          Compress-Archive -Path dist/napster-rs -DestinationPath dist/napster-rs-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napster-rs-windows-x64
+          path: dist/napster-rs-windows-x64.zip
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (Apple Silicon and Intel)
+        run: |
+          cargo build --release --workspace --target aarch64-apple-darwin
+          cargo build --release --workspace --target x86_64-apple-darwin
+      - name: Universal binaries and Napster.app
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo pkgid -p napster-gui | sed 's/.*[#@]//')
+          mkdir -p dist/napster-rs
+          for bin in napster napster-cli napd; do
+            lipo -create -output "dist/napster-rs/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin"
+          done
+          APP=dist/napster-rs/Napster.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp dist/napster-rs/napster "$APP/Contents/MacOS/napster"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Napster</string>
+            <key>CFBundleDisplayName</key><string>Napster</string>
+            <key>CFBundleIdentifier</key><string>io.github.napster-rs</string>
+            <key>CFBundleExecutable</key><string>napster</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # ad-hoc signature so Apple Silicon will launch it (not notarized)
+          codesign --force --deep --sign - "$APP"
+          cp README.md dist/napster-rs/
+          ditto -c -k --keepParent dist/napster-rs dist/napster-rs-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napster-rs-macos-universal
+          path: dist/napster-rs-macos-universal.zip
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - run: cargo build --release --workspace
+      - name: Package
+        run: |
+          mkdir -p dist/napster-rs
+          cp target/release/napster target/release/napster-cli target/release/napd README.md dist/napster-rs/
+          tar -C dist -czf dist/napster-rs-linux-x64.tar.gz napster-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napster-rs-linux-x64
+          path: dist/napster-rs-linux-x64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

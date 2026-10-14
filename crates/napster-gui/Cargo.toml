@@ -1,0 +1,21 @@
+[package]
+name = "napster-gui"
+description = "Napster desktop client (egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "napster"
+path = "src/main.rs"
+
+[dependencies]
+napster-core.workspace = true
+napster-proto.workspace = true
+anyhow.workspace = true
+eframe = "0.31"
+egui_extras = "0.31"
+rfd = "0.15"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

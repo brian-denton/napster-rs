@@ -1,0 +1,12 @@
+[package]
+name = "napster-proto"
+description = "Wire protocol for the Napster 2.0 client/server and peer-to-peer transfers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

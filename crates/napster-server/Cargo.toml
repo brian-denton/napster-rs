@@ -1,0 +1,27 @@
+[package]
+name = "napster-server"
+description = "Napster-compatible server (napd) with metaserver/redirector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "napd"
+path = "src/main.rs"
+
+[dependencies]
+napster-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,174 @@
+# Napster v2.0 BETA 10: reverse engineering notes
+
+These are the findings behind `napster-proto`. The target was the
+installed `napster.exe` from `napster2b10.exe`, analyzed statically: strings
+and x86 disassembly with capstone. Nothing from the installer was executed.
+The scripts are in [`re/`](../re).
+
+## The binaries
+
+| File | Notes |
+|---|---|
+| `napster2b10.exe` | MindVision **VISE** installer (1.8 MB). It installs `napster.exe`, `cleanap.dll`, `vmp3.nvm`, `vwma.nvm`, `lcd.ttf`, `license.txt` and `filetypes.reg`, plus `amp.dll` and `AMPL3DLite.ocx` in `system32`. It also registers the `napster:` URL protocol, the `.nap` file type and `Nap.Protocol.1`. |
+| `napster.exe` | 32-bit MSVC/MFC/ATL GUI with an image base of `0x400000`. The build stamp is `v2.0 BETA 10`, `May  5 2001 13:52:58`. It imports `WSOCK32`, `ICMP` (for pinging peers), `WININET`, `WINMM`, `WMVCore` and `amp.dll` (MP3 playback). |
+| `vmp3.nvm`, `vwma.nvm` | The "validators". They are DLLs exporting `Validate`, `Is_Media` and `ExtractMediaInfo`, which read the bitrate, frequency and length of MP3 and WMA files. `filetypes.reg` maps each extension to its validator. |
+
+Settings live in `HKLM\Software\Napster` (`CurrentUser`, `LineSpeed`,
+`MaxUploads`, `MaxDownloads`, `WaitPort` (the data port), `ProxyServer`,
+`SavePath`, …). User data files are `napster.dat`, `shared.dat`,
+`resume.dat`, `channels.dat` and `notify.dat`. `notify.dat` holds the hot list.
+
+## Key functions (VA)
+
+| VA | Role |
+|---|---|
+| `0x42f120` | `SendMessage(type, fmt, ...)`. It formats with `sprintf` and frames the result. Every outgoing message goes through it, so walking its callers produced the full list of messages the client sends. |
+| `0x42c040` | `RecvMessage(buf, max)`. Returns the message type. |
+| `0x420c50` | The main **server-message dispatcher**, a large `switch` on the type: a binary search tree plus four jump tables. |
+| `0x42df60` | Field tokenizer: space separated, `"…"` quoting, no escapes. |
+| `0x435db0` | Metaserver lookup on `server.napster.com:8875` (`0x22ab`). |
+| `0x436040` | Connect and login sequence. |
+| `0x410fb0` | `DownloadFile()`, the peer `GET` handshake. |
+| `0x426ad0` / `0x426cf0` | Handlers for server messages 900 and 901 (connection and listen tests). |
+
+## Connecting
+
+1. Resolve `server.napster.com`, falling back to `server2.napster.com`.
+   Connect to port **8875**, the metaserver.
+2. Read up to 99 bytes. The reply is either `ip:port` or `WAIT <seconds>`.
+   On `WAIT` the client shows *"Waiting %d seconds (%d) Server Busy..."* and
+   tries again.
+3. Connect to `ip:port`. Send **920** with the payload `4`, then **2**
+   (login):
+
+   ```
+   %s %s %d "%s" %d %lu %d
+   nick pass dataport "v2.0 BETA 10" linespeed 5151 flag
+   ```
+
+   `5151` (`0x141f`) is the build number. The meaning of the final flag is
+   unknown.
+4. The login loop accepts **3** (ack, carrying the email), **0** (error),
+   **5** (auto-upgrade), **900**, **910** and **911**.
+
+New accounts go through **7** (nick check). The server answers 8 (free),
+9 (taken) or 10 (invalid). Registration then uses **6**:
+`%s %s %d "%s" %d %s %d`, which adds the email. Existing accounts may be
+checked with **11** (`nick pass`), answered by 12. The COPPA age prompt
+and the demographic fields (14 and 15) are client side only.
+
+## Frame format
+
+```
+u16 length (LE) | u16 type (LE) | payload: `length` bytes of text
+```
+
+## Messages the b10 client sends
+
+All of these were found by walking the callers of `0x42f120`:
+
+```
+2 login            4 version          6 new user         7 nick check
+11 pass check      15 login options   100 share          102 unshare
+200 search         203 download req   205 privmsg        207/208 hotlist
+211 browse         215 resume search  218/219 dl start/end  220/221 ul start/end
+300 alt ports      303 hotlist rm     320 ignore list    322/323 ignore add/rm
+326 ignore clear   400 join           401 part           402 say
+410 topic          420-424 chan bans  430/431/432 invite 500 push request
+600 linkspeed      603 whois          606 setuserlevel   608 accept upload
+610 kill           612 ban            613 set dataport   614 unban
+615 banlist        617 list channels  619 queue limit    621 motd
+622/623 muzzle     624 unnuke         625 set linespeed  626 dataport error
+627 opsay          628 announce       641 direct browse accept
+651/652 cloak      700-704 change speed/pass/email/port
+750 server ping    751 ping           752 pong           753 set password
+800 reloadconfig   801 version        810 setconfig      820 clear channel
+824 emote          827 list all chans 829 kick           870 share dir
+920 pre-login
+```
+
+## Server messages the dispatcher handles
+
+These come from the decoded switch at `0x420c50`:
+
+```
+0 1 3 5 201 202 204 205 206 209 210 212 213 214 216 217
+301 302 320 321 324 325 401 403 404 405 406 407 408 409 410 420 421 430
+501 601 604 605 607 609 613 616 618 620 621 625 627 628
+640 641 642 748 750 751 752 824 828 900 901 910 931 1100 1200
+```
+
+The download flow uses the upload-request handshake. The server does not
+answer 203 directly:
+
+```
+downloader --203 nick "file"--> server --607 downloader "file" speed--> uploader
+uploader   --608 downloader "file"--> server --204 nick ip port "file" md5 speed--> downloader
+           (or 619 queue limit --> server --620 --> downloader)
+```
+
+If the uploader's port is 0, the downloader sends 500 and the uploader
+receives 501 with the downloader's address.
+
+IP addresses are the decimal value of the raw `in_addr` read as a
+little-endian integer, so `1.2.3.4` is sent as `0x04030201`.
+
+## Search
+
+The search request is built from these fragments (at `0x49b374`):
+
+```
+FILENAME CONTAINS "%s" MAX_RESULTS %s FILENAME CONTAINS "%s" LINESPEED "%s" %d BITRATE "%s" "%s"
+```
+
+The comparison operators are `AT LEAST`, `AT BEST` and `EQUAL TO`. Each
+result (201) has the form
+`"file" md5 size bitrate freq secs nick ip linespeed`.
+
+## Peer protocol (from `DownloadFile()`)
+
+```
+connect to uploader:port
+  <- "1"                                   (rejected unless the byte is 0x31)
+  -> "GET"                                 (sent on its own)
+  -> nick "filename" offset                ("%s \"%s\" %lu")
+  <- size as ascii | FILE NOT SHARED | FILE NOT FOUND | INVALID REQUEST
+  <- data ...
+```
+
+After the transfer the client sends 218 and 219 (or 220 and 221 for
+uploads). A partial download goes to `Incomplete\` and is recorded in
+`resume.dat`.
+
+In firewalled push mode the roles swap: the uploader connects, sends
+`SEND` and then `nick "file" size`, and reads back an ascii offset.
+
+Direct browse (640/641) uses `GETLIST`. The browsee replies with its nick
+and a newline, then share lines, then an empty line. The pushed variant
+starts with `SENDLIST nick\n`.
+
+## MD5
+
+Hash the first **299,008** bytes of audio, starting at the first frame
+sync after any ID3v2 tag. WMA files send the literal `WMA-FILE`.
+
+## Deliberate differences in napster-rs
+
+* **5 (auto-upgrade)** is ignored. In b10 it downloads `upgrade.exe` over
+  HTTP and runs it without asking, which is a well-known remote code
+  execution hole.
+* **900 and 901** are ignored. They make the client open connections, or
+  listen on ports, chosen by the server.
+* Feedback by SMTP to `mail.napster.com`, the CDNOW shop links and the
+  swear-word filter are not reproduced.
+* The client string is `napster-rs <version>`. The login layout is the same
+  as b10's.
+
+## References
+
+* *napster messages* by drscholl (OpenNap):
+  <https://opennap.sourceforge.net/napster.txt>. This community spec was
+  checked against the disassembly above. The b10 binary agrees with it,
+  apart from additions noted here: the 920 payload, the login build number,
+  and messages 910, 911, 931, 1100 and 1200.
+* <https://en.wikipedia.org/wiki/Napster>

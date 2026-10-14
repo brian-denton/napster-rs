@@ -1,0 +1,19 @@
+[package]
+name = "napster-cli"
+description = "Command line Napster client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "napster-cli"
+path = "src/main.rs"
+
+[dependencies]
+napster-core.workspace = true
+napster-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

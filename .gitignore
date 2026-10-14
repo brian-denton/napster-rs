@@ -1,0 +1,5 @@
+/target
+/re/.venv
+/re/out
+*.pdb
+/napd-data
