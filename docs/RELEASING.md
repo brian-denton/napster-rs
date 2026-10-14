@@ -14,7 +14,10 @@
    git push origin v0.5.0
    ```
 
-GitHub Actions then:
+Pushing the commit and pushing the tag each start a run. The commit's run
+only tests. The tag's run does the release.
+
+The tag run:
 
 1. tests on Windows, macOS and Linux;
 2. builds the three packages;

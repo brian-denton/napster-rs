@@ -1,6 +1,8 @@
-# Test on every push/PR; build Windows, macOS (universal .app) and Linux
-# packages as downloadable artifacts. Pushing a tag like v0.1.0 also
-# publishes them as a GitHub release.
+# Pushes to main and pull requests: lint and test on Windows, macOS, Linux.
+# Version tags (v*): also build the Windows, macOS (universal .app) and Linux
+# packages, sign them, and publish a GitHub release.
+# "Run workflow" (manual): tests plus packages as downloadable artifacts,
+# without a release.
 name: build
 
 on:
@@ -12,6 +14,12 @@ on:
 
 permissions:
   contents: read
+
+# A newer push to the same branch or PR cancels the older run. Tag runs
+# each have their own ref and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +50,7 @@ jobs:
 
   windows:
     needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -61,6 +70,7 @@ jobs:
 
   macos:
     needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -113,6 +123,7 @@ jobs:
 
   linux:
     needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

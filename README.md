@@ -31,7 +31,11 @@ The binaries end up in `target/release/`: `napd`, `napster` and
 ### Prebuilt packages (GitHub Actions)
 
 `.github/workflows/build.yml` runs clippy and the tests on Windows, macOS
-and Linux. It then packages:
+and Linux for every push to `main` and every pull request. A newer push
+cancels a run that's still going for the same branch.
+
+Packages are built only for version tags, or when you start the workflow
+by hand (**Actions > build > Run workflow**):
 
 | Package | Contents |
 |---|---|
@@ -39,8 +43,9 @@ and Linux. It then packages:
 | `napster-rs-macos-universal.zip` | `Napster.app` and the command-line tools, built for Intel and Apple Silicon |
 | `napster-rs-linux-x64.tar.gz` | `napster`, `napster-cli` and `napd` |
 
-Download them from the run's **Artifacts** section. Pushing a tag such as
-`v0.1.0` also attaches them to a GitHub release.
+A tag such as `v0.4.0` signs them and publishes them as a GitHub release
+(see [docs/RELEASING.md](docs/RELEASING.md)). A manual run leaves them,
+unsigned, in the run's **Artifacts** section.
 
 The macOS app is signed ad hoc but not notarized, so the first time you
 open it you'll need to right-click it and choose **Open**. The Linux
