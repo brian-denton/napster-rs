@@ -111,6 +111,19 @@ impl Peer {
         results
     }
 
+    /// Search until the server has indexed at least `n` matches. Shares are
+    /// sent right after login, so a search issued immediately can race them.
+    async fn search_until(&mut self, text: &str, n: usize) -> Vec<SearchResult> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let results = self.search(text).await;
+            if results.len() >= n || tokio::time::Instant::now() > deadline {
+                return results;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn download(&mut self, r: &SearchResult) -> PathBuf {
         self.client.send(Command::Download { nick: r.nick.clone(), file: r.file.clone() });
         self.wait(|e| match e {
@@ -148,7 +161,7 @@ async fn search_and_download() {
     alice.connect().await;
     bob.connect().await;
 
-    let results = bob.search("generic song").await;
+    let results = bob.search_until("generic song", 1).await;
     assert_eq!(results.len(), 1, "{results:?}");
     let r = &results[0];
     assert_eq!(r.nick, "alice");
@@ -171,7 +184,7 @@ async fn firewalled_uploader_pushes() {
     alice.rescan(1).await;
     alice.connect().await;
     bob.connect().await;
-    let results = bob.search("pushed").await;
+    let results = bob.search_until("pushed", 1).await;
     assert_eq!(results.len(), 1);
     let saved = bob.download(&results[0]).await;
     assert_same(&saved, &data);
@@ -190,7 +203,7 @@ async fn resume_partial_download() {
     let incomplete = bob.downloads.join("Incomplete");
     std::fs::create_dir_all(&incomplete).unwrap();
     std::fs::write(incomplete.join("resume me.mp3"), &data[..300_000]).unwrap();
-    let r = bob.search("resume").await.remove(0);
+    let r = bob.search_until("resume", 1).await.remove(0);
     let saved = bob.download(&r).await;
     assert_same(&saved, &data);
 }
@@ -207,6 +220,7 @@ async fn direct_browse_and_firewalled_browse() {
         alice.connect().await;
         bob.connect().await;
         let target = if firewalled { "carol" } else { "alice" };
+        assert_eq!(bob.search_until("mp3", 2).await.len(), 2);
         bob.client.send(Command::Browse(target.into()));
         let mut files = vec![];
         bob.wait(|e| match e {
