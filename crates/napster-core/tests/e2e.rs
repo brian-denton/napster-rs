@@ -57,6 +57,7 @@ impl Peer {
             download_dir: downloads.clone(),
             cache_library: false,
             authentic_speeds: false,
+            check_for_updates: false,
             ..ClientConfig::default()
         };
         tweak(&mut config);
@@ -313,6 +314,7 @@ async fn login_via_metaserver_and_bad_password() {
         download_dir: dir.path().to_path_buf(),
         cache_library: false,
         authentic_speeds: false,
+        check_for_updates: false,
         ..ClientConfig::default()
     };
     let (client, mut events) = Client::start(config.clone(), None);

@@ -87,18 +87,8 @@ pub fn platform_asset() -> Option<&'static str> {
 
 #[derive(Deserialize)]
 struct Release {
-    tag_name: String,
     #[serde(default)]
     body: Option<String>,
-    html_url: String,
-    #[serde(default)]
-    assets: Vec<Asset>,
-}
-
-#[derive(Deserialize)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
 }
 
 fn agent(proxy: Option<&ProxyConfig>) -> anyhow::Result<ureq::Agent> {
@@ -113,36 +103,77 @@ fn agent(proxy: Option<&ProxyConfig>) -> anyhow::Result<ureq::Agent> {
 }
 
 /// Is there a newer signed release for this platform?
+///
+/// This avoids GitHub's API, which allows only 60 anonymous requests an
+/// hour per IP address (shared by everyone behind the same router). The
+/// web page `/releases/latest` redirects to the newest release, and
+/// release downloads live at predictable addresses. The API is used only
+/// for the release notes, and a refusal there just means no notes.
 pub fn check(proxy: Option<&ProxyConfig>) -> anyhow::Result<Option<UpdateInfo>> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let release: Release = match agent(proxy)?.get(&url).set("Accept", "application/vnd.github+json").call() {
-        Ok(r) => r.into_json()?,
-        // no releases, or the repository isn't public
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(e) => return Err(anyhow!("checking for updates: {e}")),
-    };
-    choose(release)
-}
-
-fn choose(release: Release) -> anyhow::Result<Option<UpdateInfo>> {
-    if !is_newer(&release.tag_name, current_version()) {
+    let agent = agent(proxy)?;
+    let Some(tag) = latest_tag(&agent)? else { return Ok(None) };
+    if !is_newer(&tag, current_version()) {
         return Ok(None);
     }
     let Some(name) = platform_asset() else { return Ok(None) };
-    let find = |n: &str| release.assets.iter().find(|a| a.name == n).map(|a| a.browser_download_url.clone());
-    let (Some(asset_url), Some(sig_url)) = (find(name), find(&format!("{name}.sig"))) else {
-        // unsigned or missing package: never offer it
-        tracing::info!("release {} has no signed package for this platform", release.tag_name);
-        return Ok(None);
-    };
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let (asset_url, sig_url) = (format!("{base}/{name}"), format!("{base}/{name}.sig"));
+    // never offer a release that isn't signed for this platform
+    match agent.head(&sig_url).call() {
+        Ok(_) => {}
+        Err(ureq::Error::Status(404, _)) => {
+            tracing::info!("release {tag} has no signed package for this platform");
+            return Ok(None);
+        }
+        Err(e) => return Err(friendly(e)),
+    }
     Ok(Some(UpdateInfo {
-        version: release.tag_name.trim_start_matches('v').to_owned(),
-        notes: release.body.unwrap_or_default(),
-        page_url: release.html_url,
+        version: tag.trim_start_matches('v').to_owned(),
+        notes: release_notes(&agent, &tag),
+        page_url: format!("https://github.com/{REPO}/releases/tag/{tag}"),
         asset_name: name.to_owned(),
         asset_url,
         sig_url,
     }))
+}
+
+/// The newest release's tag, from where `/releases/latest` redirects.
+fn latest_tag(agent: &ureq::Agent) -> anyhow::Result<Option<String>> {
+    let url = format!("https://github.com/{REPO}/releases/latest");
+    match agent.get(&url).call() {
+        Ok(resp) => Ok(tag_from_url(resp.get_url())),
+        // no releases yet, or the repository isn't public
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(friendly(e)),
+    }
+}
+
+/// `https://github.com/o/r/releases/tag/v1.2.3` -> `v1.2.3`
+pub fn tag_from_url(url: &str) -> Option<String> {
+    let tag = url.split("/releases/tag/").nth(1)?.split(['?', '#', '/']).next()?;
+    (!tag.is_empty()).then(|| tag.to_owned())
+}
+
+/// Best effort: the API is rate limited, and notes are only nice to have.
+fn release_notes(agent: &ureq::Agent, tag: &str) -> String {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}");
+    agent
+        .get(&url)
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Release>().ok())
+        .and_then(|r| r.body)
+        .unwrap_or_default()
+}
+
+fn friendly(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(403 | 429, _) => {
+            anyhow!("GitHub is limiting requests from your network right now. Try again in a little while.")
+        }
+        other => anyhow!("checking for updates: {other}"),
+    }
 }
 
 /// Verify a base64 Ed25519 signature over `data`.
@@ -353,19 +384,26 @@ mod tests {
         VerifyingKey::from_bytes(&pk).unwrap();
     }
 
+    /// Talks to github.com: `cargo test -p napster-core live_release -- --ignored`
     #[test]
-    fn only_signed_newer_releases_are_offered() {
-        let Some(name) = platform_asset() else { return };
-        let mk = |tag: &str, with_sig: bool| {
-            let mut assets = vec![Asset { name: name.into(), browser_download_url: "https://x/pkg".into() }];
-            if with_sig {
-                assets.push(Asset { name: format!("{name}.sig"), browser_download_url: "https://x/sig".into() });
-            }
-            Release { tag_name: tag.into(), body: None, html_url: "https://x".into(), assets }
-        };
-        assert!(choose(mk("v999.0.0", true)).unwrap().is_some());
-        assert!(choose(mk("v999.0.0", false)).unwrap().is_none());
-        assert!(choose(mk("v0.0.1", true)).unwrap().is_none());
+    #[ignore]
+    fn live_release_lookup_without_api() {
+        let agent = agent(None).unwrap();
+        let tag = latest_tag(&agent).unwrap().expect("a published release");
+        println!("latest release: {tag}");
+        let name = platform_asset().unwrap();
+        let sig = format!("https://github.com/{REPO}/releases/download/{tag}/{name}.sig");
+        let r = agent.head(&sig).call();
+        println!("signature for {name}: {}", if r.is_ok() { "present" } else { "missing" });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn tags_from_release_urls() {
+        assert_eq!(tag_from_url("https://github.com/o/r/releases/tag/v0.5.1").as_deref(), Some("v0.5.1"));
+        assert_eq!(tag_from_url("https://github.com/o/r/releases/tag/v1.0.0?x=1").as_deref(), Some("v1.0.0"));
+        // no releases: /latest lands on the list page
+        assert_eq!(tag_from_url("https://github.com/o/r/releases"), None);
     }
 
     fn zip_package(files: &[(&str, &[u8])]) -> Vec<u8> {

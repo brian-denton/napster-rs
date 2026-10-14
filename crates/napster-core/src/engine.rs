@@ -307,7 +307,7 @@ impl Actor {
 
     async fn run(mut self) {
         self.rescan();
-        if self.shared.config().check_for_updates {
+        if self.shared.config().check_for_updates && auto_check_due() {
             self.check_update(false);
         }
         loop {
@@ -507,7 +507,7 @@ impl Actor {
     fn check_update(&self, manual: bool) {
         let s = self.shared.clone();
         let proxy = s.config().active_proxy().cloned();
-        tokio::task::spawn_blocking(move || match crate::update::check(proxy.as_ref()) {
+        tokio::task::spawn_blocking(move || match crate::update::check(proxy.as_ref()).inspect(|_| mark_checked()) {
             Ok(Some(info)) => s.emit(Event::UpdateAvailable(info)),
             Ok(None) if manual => s.emit(Event::UpToDate),
             Ok(None) => {}
@@ -1123,6 +1123,28 @@ fn format_ago(epoch: u64) -> String {
 
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Automatic update checks run at most once a day (manual ones always run).
+const AUTO_CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn last_check_path() -> std::path::PathBuf {
+    crate::ClientConfig::default_path().with_file_name("last_update_check")
+}
+
+fn auto_check_due() -> bool {
+    let last = std::fs::read_to_string(last_check_path()).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    last.is_none_or(|t| now.saturating_sub(t) >= AUTO_CHECK_EVERY.as_secs())
+}
+
+fn mark_checked() {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let p = last_check_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, now.to_string());
 }
 
 /// Loopback, private (RFC 1918 / unique-local), link-local or CGNAT.
