@@ -2273,6 +2273,13 @@ impl App {
                         self.selected_transfer = self.transfers.keys().next().copied();
                     }
                     Shot::Discover => self.tab = Tab::Discover,
+                    Shot::SearchWide => {
+                        // the table must follow a window resize after it was first laid out
+                        self.tab = Tab::Search;
+                        if s.elapsed().as_millis() < 50 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(1280.0, 720.0)));
+                        }
+                    }
                     Shot::Help => self.tab = Tab::Help,
                     Shot::Prefs => {
                         self.tab = Tab::Search;
@@ -2407,7 +2414,11 @@ fn list_view(
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
             for (_, w) in cols {
                 tb = if *w == 0.0 {
-                    tb.column(Column::remainder().at_least(120.0).clip(true))
+                    // Not user-resizable on purpose: egui only re-fits a
+                    // remainder column to the window when it isn't resizable,
+                    // so this one grows and shrinks with the window while the
+                    // other columns can still be dragged.
+                    tb.column(Column::remainder().at_least(120.0).clip(true).resizable(false))
                 } else {
                     tb.column(Column::initial(*w).at_least(30.0).clip(true))
                 };

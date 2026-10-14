@@ -18,6 +18,7 @@ pub enum Shot {
     Prefs,
     Splash,
     Whois,
+    SearchWide,
 }
 
 impl Shot {
@@ -34,11 +35,12 @@ impl Shot {
             Shot::Prefs => "09-preferences",
             Shot::Splash => "10-logging-on",
             Shot::Whois => "11-whois",
+            Shot::SearchWide => "12-search-resized",
         }
     }
 }
 
-pub const ORDER: [Shot; 11] = [
+pub const ORDER: [Shot; 12] = [
     Shot::Home,
     Shot::Chat,
     Shot::Library,
@@ -50,6 +52,7 @@ pub const ORDER: [Shot; 11] = [
     Shot::Prefs,
     Shot::Splash,
     Shot::Whois,
+    Shot::SearchWide,
 ];
 
 #[derive(Debug, PartialEq, Eq)]
