@@ -42,6 +42,14 @@ pub struct ClientConfig {
     /// Total upload speed cap in KB/s across all transfers (0 = unlimited).
     /// Used when `authentic_speeds` is off.
     pub upload_limit_kbps: u32,
+    /// Look for a new signed release on GitHub at startup.
+    pub check_for_updates: bool,
+    /// Encrypt the server connection (napd's TLS port, 8889 by default).
+    pub tls: bool,
+    /// Where pinned server certificates are kept (default: next to the
+    /// config file, `known_servers.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_servers: Option<PathBuf>,
 }
 
 /// Typical sustained throughput in KB/s (download, upload) for each link
@@ -90,6 +98,9 @@ impl Default for ClientConfig {
             authentic_speeds: true,
             download_limit_kbps: 0,
             upload_limit_kbps: 0,
+            check_for_updates: true,
+            tls: false,
+            known_servers: None,
         }
     }
 }

@@ -161,6 +161,8 @@ sync after any ID3v2 tag. WMA files send the literal `WMA-FILE`.
   listen on ports, chosen by the server.
 * Feedback by SMTP to `mail.napster.com`, the CDNOW shop links and the
   swear-word filter are not reproduced.
+* napd adds a TLS port (8889 by default) that carries the same framed
+  protocol inside TLS. The plain port is unchanged for the 2001 client.
 * The client string is `napster-rs <version>`. The login layout is the same
   as b10's.
 

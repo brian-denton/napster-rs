@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::RngCore;
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,8 +19,13 @@ pub fn now_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub nick: String,
+    /// Only used by legacy SHA-256 hashes; Argon2 hashes carry their own.
+    #[serde(default)]
     salt: String,
+    /// Argon2id PHC string, or legacy hex SHA-256(salt + password).
     hash: String,
+    #[serde(default = "legacy_scheme")]
+    scheme: String,
     pub email: String,
     pub level: Level,
     pub created: u64,
@@ -27,30 +34,74 @@ pub struct Account {
     pub nuked: bool,
 }
 
+fn legacy_scheme() -> String {
+    "sha256".into()
+}
+
+const ARGON2: &str = "argon2id";
+
 impl Account {
+    /// Hashing is deliberately slow; don't call this with the state lock held.
     pub fn new(nick: &str, password: &str, email: &str, level: Level) -> Self {
-        let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
-        let salt = hex(&salt);
-        let hash = hash_password(&salt, password);
         let now = now_secs();
-        Self { nick: nick.to_owned(), salt, hash, email: email.to_owned(), level, created: now, last_seen: now, nuked: false }
+        Self {
+            nick: nick.to_owned(),
+            salt: String::new(),
+            hash: argon2_hash(password),
+            scheme: ARGON2.into(),
+            email: email.to_owned(),
+            level,
+            created: now,
+            last_seen: now,
+            nuked: false,
+        }
     }
 
+    /// Slow (Argon2); don't call with the state lock held.
     pub fn check_password(&self, password: &str) -> bool {
-        hash_password(&self.salt, password) == self.hash
+        if self.scheme == ARGON2 {
+            match PasswordHash::new(&self.hash) {
+                Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
+                Err(_) => false,
+            }
+        } else {
+            let expected = legacy_hash(&self.salt, password);
+            // constant-time compare
+            expected.len() == self.hash.len()
+                && expected.bytes().zip(self.hash.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        }
     }
 
-    pub fn set_password(&mut self, password: &str) {
-        self.hash = hash_password(&self.salt, password);
+    /// Accounts from before v0.4 still use salted SHA-256.
+    pub fn needs_rehash(&self) -> bool {
+        self.scheme != ARGON2
     }
+
+    /// Take the password hash computed (outside the lock) on a copy.
+    pub fn adopt_password(&mut self, other: &Account) {
+        self.salt = other.salt.clone();
+        self.hash = other.hash.clone();
+        self.scheme = other.scheme.clone();
+    }
+
+    /// Slow (Argon2); don't call with the state lock held.
+    pub fn set_password(&mut self, password: &str) {
+        self.hash = argon2_hash(password);
+        self.scheme = ARGON2.into();
+        self.salt.clear();
+    }
+}
+
+fn argon2_hash(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default().hash_password(password.as_bytes(), &salt).expect("argon2 hashing").to_string()
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hash_password(salt: &str, password: &str) -> String {
+fn legacy_hash(salt: &str, password: &str) -> String {
     let mut h = Sha256::new();
     h.update(salt.as_bytes());
     h.update(password.as_bytes());
@@ -129,6 +180,21 @@ pub fn write_snapshot(snapshot: Option<(PathBuf, Vec<u8>)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_hashes_still_work_and_upgrade() {
+        let mut a = Account::new("old", "pw", "e", Level::User);
+        a.scheme = "sha256".into();
+        a.salt = "abcd".into();
+        a.hash = legacy_hash("abcd", "pw");
+        assert!(a.check_password("pw"));
+        assert!(!a.check_password("nope"));
+        assert!(a.needs_rehash());
+        a.set_password("pw");
+        assert!(!a.needs_rehash());
+        assert!(a.hash.starts_with("$argon2id$"));
+        assert!(a.check_password("pw"));
+    }
 
     #[test]
     fn passwords() {

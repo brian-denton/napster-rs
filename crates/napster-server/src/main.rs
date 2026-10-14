@@ -36,6 +36,24 @@ struct Args {
     /// Nick that is given Elite (full admin) level (repeatable).
     #[arg(long)]
     elite: Vec<String>,
+    /// Address for the encrypted (TLS) port used by napster-rs clients.
+    #[arg(long, default_value = "0.0.0.0:8889")]
+    tls_listen: SocketAddr,
+    /// Don't open the TLS port.
+    #[arg(long)]
+    no_tls: bool,
+    /// PEM certificate chain for TLS (default: self-signed, kept in the data dir).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Simultaneous connections allowed per IP address (0 = no limit).
+    #[arg(long, default_value_t = 8)]
+    max_conns_per_ip: usize,
+    /// Files each user may share.
+    #[arg(long, default_value_t = 20_000)]
+    max_shares: usize,
 }
 
 #[tokio::main]
@@ -53,6 +71,11 @@ async fn main() -> anyhow::Result<()> {
         data_dir: Some(args.data_dir),
         max_results: args.max_results,
         elite: args.elite,
+        tls_listen: (!args.no_tls).then_some(args.tls_listen),
+        tls_cert: args.tls_cert,
+        tls_key: args.tls_key,
+        max_conns_per_ip: args.max_conns_per_ip,
+        max_shares: args.max_shares,
         ..Config::default()
     };
     if let Some(path) = args.motd {

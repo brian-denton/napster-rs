@@ -5,6 +5,7 @@ use std::time::Instant;
 use napster_proto::{FileInfo, SearchQuery, SearchResult};
 
 use crate::config::ClientConfig;
+use crate::update::UpdateInfo;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -38,6 +39,10 @@ pub enum Command {
     Unignore(String),
     /// Send an arbitrary message (for /raw and admin commands).
     Raw(u16, String),
+    /// Look for a newer release. `manual` also reports "up to date" and errors.
+    CheckForUpdate { manual: bool },
+    /// Download, verify and install a release found by `CheckForUpdate`.
+    InstallUpdate(UpdateInfo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,4 +177,11 @@ pub enum Event {
     ServerPong { millis: u64 },
     Announcement { from: String, text: String },
     ChannelInvite { from: String, channel: String },
+    UpdateAvailable(UpdateInfo),
+    /// Reply to a manual check when there's nothing newer.
+    UpToDate,
+    UpdateProgress(String),
+    /// Installed; launching `relaunch` starts the new version.
+    UpdateInstalled { version: String, relaunch: std::path::PathBuf },
+    UpdateFailed(String),
 }

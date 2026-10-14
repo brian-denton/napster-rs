@@ -10,26 +10,30 @@ use anyhow::bail;
 use futures::{SinkExt, StreamExt};
 use napster_proto::codec::CodecError;
 use napster_proto::{ip, msg, quote, valid_nick, Message, NapCodec, SearchQuery, SearchResult};
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{now_secs, write_snapshot, Account, Ban};
+use crate::guard::ConnSlot;
 use crate::state::{Channel, Level, Session, State};
 use crate::{Shared, VERSION};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) async fn handle(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
-    stream.set_nodelay(true)?;
+/// Serve one connection (plain TCP or TLS). `_slot` holds this address's
+/// connection-limit slot until we return.
+pub(crate) async fn handle<S>(shared: Arc<Shared>, stream: S, peer: SocketAddr, _slot: ConnSlot) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(v6) => v6.to_ipv4_mapped().unwrap_or(Ipv4Addr::LOCALHOST),
     };
-    let (r, w) = stream.into_split();
+    let (r, w) = tokio::io::split(stream);
     let mut reader = FramedRead::new(r, NapCodec);
     let mut writer = FramedWrite::new(w, NapCodec);
     let (tx, mut rx) = unbounded_channel::<Message>();
@@ -51,7 +55,13 @@ pub(crate) async fn handle(shared: Arc<Shared>, stream: TcpStream, peer: SocketA
         ip,
         remote_port: peer.port(),
         nick: None,
+        tokens: 0.0,
+        refilled: Instant::now(),
+        dropped: 0,
+        warned: None,
+        share_warned: false,
     };
+    conn.tokens = conn.shared.config.msg_burst;
     tracing::debug!("{peer}: connected");
     let result = conn.run(&mut reader).await;
     conn.cleanup();
@@ -70,9 +80,16 @@ struct Conn {
     remote_port: u16,
     /// Set once logged in.
     nick: Option<String>,
+    /// flood control: token bucket of messages
+    tokens: f64,
+    refilled: Instant,
+    dropped: u32,
+    warned: Option<Instant>,
+    share_warned: bool,
 }
 
-type Reader = FramedRead<OwnedReadHalf, NapCodec>;
+/// Messages dropped for flooding before the connection is cut.
+const FLOOD_DISCONNECT: u32 = 300;
 
 fn err(text: impl Into<String>) -> Message {
     Message::new(msg::SERVER_ERROR, text)
@@ -95,7 +112,7 @@ impl Conn {
         self.nick().to_lowercase()
     }
 
-    async fn run(&mut self, reader: &mut Reader) -> anyhow::Result<()> {
+    async fn run<R: AsyncRead + Unpin>(&mut self, reader: &mut FramedRead<R, NapCodec>) -> anyhow::Result<()> {
         let deadline = Instant::now() + LOGIN_TIMEOUT;
         loop {
             let next = tokio::select! {
@@ -117,10 +134,47 @@ impl Conn {
                     // give the writer a chance to deliver the error
                     return Ok(());
                 }
-            } else {
+            } else if self.allow(m.kind) {
                 self.dispatch(m);
+            } else if self.dropped >= FLOOD_DISCONNECT {
+                self.error("Disconnected for flooding.");
+                bail!("flooding");
             }
         }
+    }
+
+    /// Flood control. Shares and transfer bookkeeping are exempt (a client
+    /// sends thousands of 100s at login); everything else draws from a
+    /// token bucket.
+    fn allow(&mut self, kind: u16) -> bool {
+        if matches!(
+            kind,
+            msg::SHARE_FILE
+                | msg::UNSHARE_FILE
+                | msg::UNSHARE_ALL
+                | msg::SHARE_DIRECTORY
+                | msg::HOTLIST_INIT
+                | msg::DOWNLOAD_START
+                | msg::DOWNLOAD_COMPLETE
+                | msg::UPLOAD_START
+                | msg::UPLOAD_COMPLETE
+        ) {
+            return true;
+        }
+        let cfg = &self.shared.config;
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.refilled).as_secs_f64() * cfg.msg_rate).min(cfg.msg_burst);
+        self.refilled = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return true;
+        }
+        self.dropped += 1;
+        if self.warned.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            self.warned = Some(now);
+            self.error("You are sending messages too fast; some were ignored.");
+        }
+        false
     }
 
     // ---------------------------------------------------------------- login
@@ -144,10 +198,16 @@ impl Conn {
             msg::PASSWORD_CHECK => {
                 let mut a = m.args();
                 let (nick, pass) = (a.str().unwrap_or(""), a.str().unwrap_or(""));
-                let ok = self.shared.lock().db.get(nick).is_none_or(|acc| acc.check_password(pass));
-                if ok {
+                let ip = IpAddr::V4(self.ip);
+                if self.shared.guard().login_locked(ip) {
+                    self.reply(msg::ERROR, "Too many failed logins from your address. Try again later.");
+                    return false;
+                }
+                let account = self.shared.lock().db.get(nick).cloned();
+                if account.is_none_or(|acc| acc.check_password(pass)) {
                     self.reply(msg::PASSWORD_OK, "");
                 } else {
+                    self.shared.guard().login_failed(ip);
                     self.reply(msg::ERROR, "invalid password");
                 }
                 true
@@ -180,39 +240,82 @@ impl Conn {
             self.reply(msg::ERROR, "invalid password");
             return false;
         }
-        let key = nick.to_lowercase();
-        let mut st = self.shared.lock();
-        if let Some(ban) = st.db.banned(&nick, &self.ip.to_string()) {
-            let reason = ban.reason.clone();
-            self.reply(msg::ERROR, format!("You are banned from this server: {reason}"));
+        if pass.len() > 64 {
+            self.reply(msg::ERROR, "Password is too long");
             return false;
         }
+        let key = nick.to_lowercase();
+        let ip = IpAddr::V4(self.ip);
+        if self.shared.guard().login_locked(ip) {
+            self.reply(msg::ERROR, "Too many failed logins from your address. Try again later.");
+            return false;
+        }
+        let existing = {
+            let st = self.shared.lock();
+            if let Some(ban) = st.db.banned(&nick, &self.ip.to_string()) {
+                let reason = ban.reason.clone();
+                drop(st);
+                self.reply(msg::ERROR, format!("You are banned from this server: {reason}"));
+                return false;
+            }
+            st.db.get(&nick).cloned()
+        };
         let elite = self.shared.config.elite.iter().any(|e| e.eq_ignore_ascii_case(&nick));
-        match st.db.get_mut(&nick) {
+        // Password hashing is slow by design, so it happens without the lock.
+        let fresh = match &existing {
             Some(acc) => {
                 if new_user {
-                    drop(st);
                     self.reply(msg::ERROR, format!("Nickname {nick} is already registered"));
                     return false;
                 }
                 if acc.nuked {
-                    drop(st);
                     self.reply(msg::ERROR, "This account has been nuked");
                     return false;
                 }
                 if !acc.check_password(&pass) {
-                    drop(st);
+                    self.shared.guard().login_failed(ip);
                     self.reply(msg::ERROR, "invalid password");
                     return false;
                 }
-                if elite {
-                    acc.level = Level::Elite;
-                }
+                self.shared.guard().login_ok(ip);
+                // upgrade pre-v0.4 SHA-256 hashes now that we know the password
+                acc.needs_rehash().then(|| {
+                    let mut a = acc.clone();
+                    a.set_password(&pass);
+                    a
+                })
             }
             None => {
+                if !self.shared.guard().try_signup(ip) {
+                    self.reply(msg::ERROR, "Too many new accounts from your address. Try again later.");
+                    return false;
+                }
                 let email = if email.is_empty() { "anon@napster.com" } else { &email };
                 let level = if elite { Level::Elite } else { Level::User };
-                st.db.insert(Account::new(&nick, &pass, email, level));
+                Some(Account::new(&nick, &pass, email, level))
+            }
+        };
+        let mut st = self.shared.lock();
+        match (st.db.get_mut(&nick), fresh) {
+            // someone registered this nick while we were hashing
+            (Some(_), Some(_)) if existing.is_none() => {
+                drop(st);
+                self.reply(msg::ERROR, format!("Nickname {nick} is already registered"));
+                return false;
+            }
+            (Some(acc), Some(upgraded)) => acc.adopt_password(&upgraded),
+            (None, Some(new)) => st.db.insert(new),
+            (Some(_), None) => {}
+            (None, None) => {
+                // deleted while we were checking
+                drop(st);
+                self.reply(msg::ERROR, "invalid password");
+                return false;
+            }
+        }
+        if elite {
+            if let Some(acc) = st.db.get_mut(&nick) {
+                acc.level = Level::Elite;
             }
         }
         let acc = st.db.get(&nick).cloned().expect("just ensured");
@@ -463,18 +566,34 @@ impl Conn {
 
     // -------------------------------------------------------------- library
 
-    fn share(&self, m: &Message) {
+    fn share(&mut self, m: &Message) {
         match napster_proto::FileInfo::parse_share(&m.data) {
-            Some(f) => self.with_me(|s| {
-                if !s.files.iter().any(|x| x.filename == f.filename) {
-                    s.files.push(f);
-                }
-            }),
+            Some(f) => self.add_shares(vec![f]),
             None => self.error("invalid share request"),
         }
     }
 
-    fn share_directory(&self, m: &Message) {
+    fn add_shares(&mut self, files: Vec<napster_proto::FileInfo>) {
+        let max = self.shared.config.max_shares;
+        let mut over = false;
+        self.with_me(|s| {
+            for f in files {
+                if s.files.len() >= max {
+                    over = true;
+                    break;
+                }
+                if !s.files.iter().any(|x| x.filename == f.filename) {
+                    s.files.push(f);
+                }
+            }
+        });
+        if over && !self.share_warned {
+            self.share_warned = true;
+            self.error(format!("This server lets each user share at most {max} files; the rest were ignored."));
+        }
+    }
+
+    fn share_directory(&mut self, m: &Message) {
         let mut a = m.args();
         let Some(dir) = a.str() else { return };
         let sep = if dir.contains('\\') { '\\' } else { '/' };
@@ -483,13 +602,7 @@ impl Conn {
             f.filename = format!("{}{}{}", dir.trim_end_matches(sep), sep, f.filename);
             files.push(f);
         }
-        self.with_me(|s| {
-            for f in files {
-                if !s.files.iter().any(|x| x.filename == f.filename) {
-                    s.files.push(f);
-                }
-            }
-        });
+        self.add_shares(files);
     }
 
     fn unshare(&self, m: &Message) {
@@ -872,6 +985,15 @@ impl Conn {
         let mut st = self.shared.lock();
         let Some(me) = st.session(self.nick()) else { return };
         let (level, ip) = (me.level, me.ip.to_string());
+        if me.channels.len() >= self.shared.config.max_channels_per_user && !me.channels.contains(&key) {
+            return self.error("You are in too many channels already.");
+        }
+        if !st.channels.contains_key(&key) {
+            let user_made = st.channels.values().filter(|c| !c.permanent).count();
+            if user_made >= self.shared.config.max_user_channels && level < Level::Moderator {
+                return self.error("This server has too many channels; join an existing one.");
+            }
+        }
         let ch = st.channels.entry(key.clone()).or_insert_with(|| Channel::new(&name, false));
         if ch.members.contains(&me_key) {
             return;

@@ -19,6 +19,10 @@ use crate::throttle;
 use crate::types::*;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Peer connections being set up at once; more are dropped.
+const MAX_INCOMING: usize = 32;
+/// Free space to leave on the download disk.
+const DISK_MARGIN: u64 = 64 * 1024 * 1024;
 /// No data for this long kills a transfer.
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -30,6 +34,7 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub(crate) async fn listen(shared: Arc<Shared>, listener: TcpListener, cancel: CancellationToken) {
     tracing::info!("data port listening on {:?}", listener.local_addr());
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING));
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => return,
@@ -37,8 +42,13 @@ pub(crate) async fn listen(shared: Arc<Shared>, listener: TcpListener, cancel: C
         };
         match accepted {
             Ok((stream, peer)) => {
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    tracing::info!("peer {peer}: too many incoming connections, dropped");
+                    continue;
+                };
                 let shared = shared.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_incoming(shared, stream).await {
                         tracing::debug!("peer {peer}: {e}");
                     }
@@ -138,6 +148,7 @@ pub(crate) async fn push_upload(shared: Arc<Shared>, nick: String, addr: SocketA
     let (id, cancel) =
         shared.new_transfer(Direction::Upload, &nick, &filename, size, &md5, TransferState::Connecting);
     let result: anyhow::Result<()> = async {
+        shared.check_peer(addr)?;
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
         stream.set_nodelay(true)?;
         peer::expect_ack(&mut stream).await?;
@@ -268,6 +279,7 @@ pub(crate) async fn download(shared: Arc<Shared>, id: u64, nick: String, addr: S
     let cancel = lock(&shared.transfers).map.get(&id).map(|e| e.cancel.clone()).unwrap_or_default();
     shared.update(id, |t| t.state = TransferState::Connecting);
     let result: anyhow::Result<()> = async {
+        shared.check_peer(addr)?;
         let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => s,
             _ => {
@@ -292,6 +304,11 @@ pub(crate) async fn download(shared: Arc<Shared>, id: u64, nick: String, addr: S
         if size == 0 {
             anyhow::bail!("File '{}' has a 0 byte file size!", info.basename());
         }
+        // the search result told us the size; a peer claiming otherwise
+        // could be trying to fill our disk
+        if info.size > 0 && size != info.size {
+            anyhow::bail!("peer sent a different file size ({size}) than it advertised ({})", info.size);
+        }
         receive_data(&shared, id, cancel.clone(), stream, leftover, &filename, offset, size).await
     }
     .await;
@@ -315,6 +332,13 @@ async fn receive_push(
         return stream.shutdown().await;
     };
     let cancel = lock(&shared.transfers).map.get(&id).map(|e| e.cancel.clone()).unwrap_or_default();
+    let advertised = shared.transfer(id).map(|t| t.size).unwrap_or(0);
+    if size == 0 || (advertised > 0 && size != advertised) {
+        stream.write_all(peer::INVALID_REQUEST.as_bytes()).await?;
+        shared.fail(id, format!("peer pushed a different file size ({size}) than it advertised ({advertised})"));
+        shared.pump_downloads();
+        return stream.shutdown().await;
+    }
     let (partial, _) = download_paths(&shared, &filename);
     let mut offset = partial_len(&partial).await;
     if offset >= size {
@@ -344,6 +368,12 @@ async fn receive_data(
     let (partial, final_path) = download_paths(shared, filename);
     if let Some(dir) = partial.parent() {
         tokio::fs::create_dir_all(dir).await?;
+        let need = size.saturating_sub(offset) + DISK_MARGIN;
+        if let Ok(free) = fs2::available_space(dir) {
+            if free < need {
+                anyhow::bail!("not enough disk space ({} MB free)", free / (1024 * 1024));
+            }
+        }
     }
     let mut file = OpenOptions::new().create(true).write(true).truncate(offset == 0).open(&partial).await?;
     file.set_len(offset).await?;
@@ -416,6 +446,7 @@ async fn receive_data(
 /// 641: connect to the browsee and GETLIST.
 pub(crate) async fn fetch_list(shared: Arc<Shared>, nick: String, addr: SocketAddr) {
     let result: anyhow::Result<()> = async {
+        shared.check_peer(addr)?;
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
         peer::expect_ack(&mut stream).await?;
         stream.write_all(peer::GETLIST).await?;
@@ -440,6 +471,7 @@ pub(crate) async fn fetch_list(shared: Arc<Shared>, nick: String, addr: SocketAd
 /// 640 with an address: we're firewalled, push our list (SENDLIST).
 pub(crate) async fn push_list(shared: Arc<Shared>, addr: SocketAddr) {
     let result: anyhow::Result<()> = async {
+        shared.check_peer(addr)?;
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
         peer::expect_ack(&mut stream).await?;
         let mut out = format!("SENDLIST {}\n", shared.my_nick()).into_bytes();

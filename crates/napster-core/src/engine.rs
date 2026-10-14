@@ -53,6 +53,8 @@ pub(crate) struct Shared {
     /// Bandwidth shared by all downloads / all uploads.
     pub down_throttle: Throttle,
     pub up_throttle: Throttle,
+    /// Address of the server we're logged in to.
+    pub server_ip: Mutex<Option<std::net::IpAddr>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -88,6 +90,22 @@ impl Shared {
 
     pub fn config(&self) -> ClientConfig {
         lock(&self.config).clone()
+    }
+
+    /// A server on the internet has no business sending us to machines on
+    /// our own network (a malicious server could use clients to probe
+    /// LANs), so peers at private addresses are only allowed when the
+    /// server itself is local.
+    pub fn check_peer(&self, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+        let server = *lock(&self.server_ip);
+        let server_is_local = server.is_none_or(is_local_ip);
+        if !server_is_local && is_local_ip(addr.ip()) {
+            anyhow::bail!("refusing to connect to private address {} for a server on the internet", addr.ip());
+        }
+        if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            anyhow::bail!("refusing to connect to invalid address {addr}");
+        }
+        Ok(())
     }
 
     /// Current (download, upload) caps in bytes/second; 0 = unlimited.
@@ -237,6 +255,7 @@ impl Client {
             pending_browses: Mutex::new(HashSet::new()),
             down_throttle: Throttle::default(),
             up_throttle: Throttle::default(),
+            server_ip: Mutex::new(None),
         });
         tokio::spawn(Actor::new(shared, rx).run());
         (Client { tx }, erx)
@@ -247,7 +266,11 @@ impl Client {
     }
 }
 
-type ServerReader = FramedRead<tokio::net::tcp::OwnedReadHalf, NapCodec>;
+/// A server connection, plain or TLS.
+trait ServerIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ServerIo for T {}
+
+type ServerReader = FramedRead<tokio::io::ReadHalf<Box<dyn ServerIo>>, NapCodec>;
 
 struct Actor {
     shared: Arc<Shared>,
@@ -276,6 +299,9 @@ impl Actor {
 
     async fn run(mut self) {
         self.rescan();
+        if self.shared.config().check_for_updates {
+            self.check_update(false);
+        }
         loop {
             tokio::select! {
                 cmd = self.cmds.recv() => match cmd {
@@ -335,6 +361,14 @@ impl Actor {
                 }
             }
             Command::Download { nick, file } => {
+                if !crate::is_audio_file(&file.filename) {
+                    s.emit(Event::Error(format!(
+                        "Refusing to download {:?}: Napster only downloads audio files ({}).",
+                        file.basename(),
+                        crate::AUDIO_EXTENSIONS.join(", ")
+                    )));
+                    return;
+                }
                 if nick.eq_ignore_ascii_case(&s.my_nick()) {
                     s.emit(Event::Error("You can't download from yourself.".into()));
                     return;
@@ -448,7 +482,29 @@ impl Actor {
                     s.emit(Event::Error("Not connected to Server!".into()));
                 }
             }
+            Command::CheckForUpdate { manual } => self.check_update(manual),
+            Command::InstallUpdate(info) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || {
+                    let progress = |msg: &str| s.emit(Event::UpdateProgress(msg.to_owned()));
+                    match crate::update::install(&info, progress) {
+                        Ok(relaunch) => s.emit(Event::UpdateInstalled { version: info.version, relaunch }),
+                        Err(e) => s.emit(Event::UpdateFailed(format!("{e:#}"))),
+                    }
+                });
+            }
         }
+    }
+
+    fn check_update(&self, manual: bool) {
+        let s = self.shared.clone();
+        tokio::task::spawn_blocking(move || match crate::update::check() {
+            Ok(Some(info)) => s.emit(Event::UpdateAvailable(info)),
+            Ok(None) if manual => s.emit(Event::UpToDate),
+            Ok(None) => {}
+            Err(e) if manual => s.emit(Event::UpdateFailed(format!("{e:#}"))),
+            Err(e) => tracing::info!("update check failed: {e:#}"),
+        });
     }
 
     fn rescan(&mut self) {
@@ -543,11 +599,34 @@ impl Actor {
                 .ok_or_else(|| anyhow!("Unable to resolve Server address {}!", cfg.server))?
         };
         self.shared.emit(Event::Status("Connecting to Server...".into()));
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow!("Failed connecting to Server..."))?
             .context("Failed connecting to Server...")?;
-        stream.set_nodelay(true)?;
+        tcp.set_nodelay(true)?;
+        let stream: Box<dyn ServerIo> = if cfg.tls {
+            if cfg.use_metaserver {
+                bail!("Encrypted connections need a direct server address, not a metaserver.");
+            }
+            let host = cfg.server.rsplit_once(':').map(|(h, _)| h).unwrap_or(&cfg.server);
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let path = cfg.known_servers.clone().unwrap_or_else(crate::tls::KnownServers::default_path);
+            let mut known = crate::tls::KnownServers::load(&path);
+            let c = timeout(CONNECT_TIMEOUT, crate::tls::connect(tcp, host, addr.port(), &mut known))
+                .await
+                .map_err(|_| anyhow!("TLS handshake with the server timed out"))??;
+            if let Some(fp) = c.newly_pinned {
+                self.shared.emit(Event::Info(format!(
+                    "First encrypted connection to {}: trusting its certificate (SHA-256 {fp}). \
+                     You'll be warned if it ever changes.",
+                    cfg.server
+                )));
+            }
+            Box::new(c.stream)
+        } else {
+            Box::new(tcp)
+        };
+        *lock(&self.shared.server_ip) = Some(addr.ip());
         let mut framed = Framed::new(stream, NapCodec);
         // exactly the b10 login layout: nick pass port "client" speed build flag
         framed
@@ -577,7 +656,7 @@ impl Actor {
         };
 
         let parts = framed.into_parts();
-        let (r, w) = parts.io.into_split();
+        let (r, w) = tokio::io::split(parts.io);
         let mut reader = FramedRead::new(r, NapCodec);
         *reader.read_buffer_mut() = parts.read_buf;
         let (tx, mut rx) = unbounded_channel::<Message>();
@@ -1012,4 +1091,26 @@ fn format_ago(epoch: u64) -> String {
 
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Loopback, private (RFC 1918 / unique-local), link-local or CGNAT.
+pub(crate) fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_local_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
 }

@@ -120,6 +120,15 @@ struct BrowseView {
     selected: HashSet<usize>,
 }
 
+/// The update dialog's current step.
+enum UpdateStep {
+    Available(napster_core::UpdateInfo),
+    Working(String),
+    Installed { version: String, relaunch: PathBuf },
+    Failed(String),
+    UpToDate,
+}
+
 /// What a right-click menu or button asked for, applied after drawing.
 #[derive(Clone)]
 enum Act {
@@ -159,6 +168,7 @@ pub struct App {
     whois: Option<Vec<(String, String)>>,
     prefs: Option<ClientConfig>,
     force_splash: bool,
+    update: Option<UpdateStep>,
     snap: Option<Snapshots>,
     snap_whois: Option<Vec<(String, String)>>,
 }
@@ -212,6 +222,7 @@ impl App {
             whois: None,
             prefs: None,
             force_splash: false,
+            update: None,
             snap: Snapshots::from_env(),
             snap_whois: None,
         };
@@ -439,6 +450,21 @@ impl App {
             Event::Announcement { from, text } => self.log(Line::err(format!("* [Announcement] {from}: {text}"))),
             Event::ChannelInvite { from, channel } => {
                 self.log(Line::sys(format!("User {from} has invited you to a chat room! (/join {channel})")))
+            }
+            Event::UpdateAvailable(info) => {
+                if self.snap.is_none() {
+                    self.update = Some(UpdateStep::Available(info));
+                }
+            }
+            Event::UpToDate => self.update = Some(UpdateStep::UpToDate),
+            Event::UpdateProgress(msg) => self.update = Some(UpdateStep::Working(msg)),
+            Event::UpdateInstalled { version, relaunch } => {
+                self.log(Line::sys(format!("Updated to napster-rs {version}.")));
+                self.update = Some(UpdateStep::Installed { version, relaunch });
+            }
+            Event::UpdateFailed(e) => {
+                self.log(Line::err(format!("Update failed: {e}")));
+                self.update = Some(UpdateStep::Failed(e));
             }
         }
     }
@@ -726,6 +752,12 @@ impl App {
                     ui.menu_button("Help", |ui| {
                         if ui.button("Help Topics").clicked() || ui.button("About Napster").clicked() {
                             self.tab = Tab::Help;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Check for Updates...").clicked() {
+                            self.update = Some(UpdateStep::Working("Checking for updates...".into()));
+                            self.client.send(Command::CheckForUpdate { manual: true });
                             ui.close_menu();
                         }
                     });
@@ -1688,6 +1720,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 ui.checkbox(&mut draft.auto_connect, "Connect to the Server when Napster starts");
+                ui.checkbox(&mut draft.check_for_updates, "Check for new versions of Napster when it starts");
             });
             ui.add_space(6.0);
             classic::group(ui, "Server Settings", |ui| {
@@ -1697,6 +1730,9 @@ impl App {
                     ui.end_row();
                     ui.label("");
                     ui.checkbox(&mut draft.use_metaserver, "This is a metaserver (redirector, port 8875)");
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut draft.tls, "Encrypt the connection (TLS; napd's port 8889)");
                     ui.end_row();
                 });
             });
@@ -1769,6 +1805,108 @@ impl App {
             self.log(Line::sys("Preferences saved."));
         } else if !cancel && open {
             self.prefs = Some(draft);
+        }
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let Some(step) = &self.update else { return };
+        let current = napster_core::update::current_version();
+        let mut open = true;
+        let mut next: Option<Option<UpdateStep>> = None;
+        let mut install: Option<napster_core::UpdateInfo> = None;
+        let mut restart: Option<PathBuf> = None;
+        classic::dialog(ctx, "update", "Napster Update", &mut open, 420.0, |ui| {
+            match step {
+                UpdateStep::Available(info) => {
+                    ui.label(bold(format!("Napster (napster-rs) {} is available.", info.version)));
+                    ui.label(format!("You have version {current}."));
+                    ui.add_space(4.0);
+                    if !info.notes.trim().is_empty() {
+                        classic::sunken(ui, vec2(406.0, 140.0), Color32::WHITE, |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                                ui.label(info.notes.trim());
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                    ui.label(
+                        RichText::new("The update is downloaded from GitHub and its signature is checked before it is installed.")
+                            .color(classic::DISABLED),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
+                        if classic::button(ui, "Update Now", Some(96.0)).clicked() {
+                            install = Some(info.clone());
+                        }
+                        if classic::button(ui, "Later", Some(96.0)).clicked() {
+                            next = Some(None);
+                        }
+                    });
+                }
+                UpdateStep::Working(msg) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(msg);
+                    });
+                    ui.add_space(4.0);
+                }
+                UpdateStep::Installed { version, relaunch } => {
+                    ui.label(bold(format!("Napster has been updated to {version}.")));
+                    ui.label("Restart Napster to use the new version.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() - 2.0 * 96.0 - 8.0);
+                        if classic::button(ui, "Restart Now", Some(96.0)).clicked() {
+                            restart = Some(relaunch.clone());
+                        }
+                        if classic::button(ui, "Later", Some(96.0)).clicked() {
+                            next = Some(None);
+                        }
+                    });
+                }
+                UpdateStep::Failed(e) => {
+                    ui.colored_label(C_ERROR, format!("Error while auto upgrading: {e}"));
+                    ui.label("You can download the latest version from the GitHub releases page.");
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if classic::button(ui, "OK", Some(84.0)).clicked() {
+                            next = Some(None);
+                        }
+                    });
+                }
+                UpdateStep::UpToDate => {
+                    ui.label(format!("You have the latest version of Napster (napster-rs {current})."));
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if classic::button(ui, "OK", Some(84.0)).clicked() {
+                            next = Some(None);
+                        }
+                    });
+                }
+            }
+        });
+        if let Some(info) = install {
+            self.client.send(Command::InstallUpdate(info));
+            next = Some(Some(UpdateStep::Working("Downloading update...".into())));
+        }
+        if let Some(path) = restart {
+            match napster_core::update::relaunch(&path) {
+                Ok(()) => {
+                    self.client.send(Command::Disconnect);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => next = Some(Some(UpdateStep::Failed(format!("couldn't restart: {e}")))),
+            }
+        }
+        if !open {
+            next = Some(None);
+        }
+        if let Some(n) = next {
+            self.update = n;
+        }
+        if matches!(self.update, Some(UpdateStep::Working(_))) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
@@ -1893,6 +2031,7 @@ impl eframe::App for App {
             });
         self.whois_window(ctx);
         self.prefs_window(ctx);
+        self.update_window(ctx);
         self.splash(ctx);
         if self.transfers.values().any(|t| t.state == TransferState::Transferring) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -2111,7 +2250,12 @@ fn clock() -> String {
     hms(now % 86400)
 }
 
+/// Open a folder, or play an audio file. Anything else (an `.exe` someone
+/// passed off as a song, say) is only shown in its folder, never run.
 fn open_path(p: &std::path::Path) {
+    if p.is_file() && !napster_core::is_audio_file(&p.to_string_lossy()) {
+        return reveal(p);
+    }
     let _ = std::fs::create_dir_all(if p.is_dir() || p.extension().is_none() { p } else { p.parent().unwrap_or(p) });
     #[cfg(windows)]
     let r = std::process::Command::new("explorer").arg(p).spawn();
@@ -2121,6 +2265,19 @@ fn open_path(p: &std::path::Path) {
     let r = std::process::Command::new("xdg-open").arg(p).spawn();
     if let Err(e) = r {
         tracing::warn!("open {}: {e}", p.display());
+    }
+}
+
+/// Show a file selected in its folder without opening it.
+fn reveal(p: &std::path::Path) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).spawn();
+    if let Err(e) = r {
+        tracing::warn!("reveal {}: {e}", p.display());
     }
 }
 

@@ -138,10 +138,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # Clients only install updates whose .sig verifies against the public
+      # key built into them. Fails the release if the secret is missing.
+      - name: Sign packages
+        env:
+          NAPSTER_SIGNING_KEY: ${{ secrets.NAPSTER_SIGNING_KEY }}
+        run: cargo run --quiet --release -p napster-sign -- sign dist/*.zip dist/*.tar.gz
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

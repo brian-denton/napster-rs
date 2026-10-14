@@ -1,0 +1,13 @@
+[package]
+name = "napster-sign"
+description = "Signs release packages for napster-rs auto-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true

@@ -21,6 +21,9 @@ struct Args {
     /// Treat --server as a metaserver (redirector).
     #[arg(long)]
     meta: bool,
+    /// Encrypt the server connection (napd's TLS port, 8889).
+    #[arg(long)]
+    tls: bool,
     #[arg(long)]
     nick: Option<String>,
     #[arg(long)]
@@ -48,6 +51,10 @@ struct Args {
     /// Interface for the data port listener (default 0.0.0.0).
     #[arg(long)]
     bind_host: Option<String>,
+    /// Install a signed update package from disk (the .sig must be next
+    /// to it) and exit.
+    #[arg(long, value_name = "PACKAGE")]
+    apply_update: Option<PathBuf>,
     /// Save the resulting settings back to the config file.
     #[arg(long)]
     save: bool,
@@ -65,6 +72,7 @@ commands:
   /msg <user> <text>  /whois <user>  /ping <user>
   /hotlist [add|rm <user>]
   /raw <numeric> <data>
+  /update                  check for a new version and install it
 anything else is said in the current room.";
 
 struct Ui {
@@ -73,6 +81,8 @@ struct Ui {
     room: Option<String>,
     transfers: BTreeMap<u64, TransferInfo>,
     files: Vec<FileInfo>,
+    /// /update was typed: install whatever the check finds
+    install_when_found: bool,
 }
 
 #[tokio::main]
@@ -84,11 +94,19 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    if let Some(pkg) = &args.apply_update {
+        let installed = napster_core::update::install_local(pkg)?;
+        println!("installed {} -> {}", pkg.display(), installed.display());
+        return Ok(());
+    }
     let path = args.config.clone().unwrap_or_else(ClientConfig::default_path);
     let mut config = ClientConfig::load(&path)?;
     if let Some(s) = args.server {
         config.server = s;
         config.use_metaserver = args.meta;
+    }
+    if args.tls {
+        config.tls = true;
     }
     if let Some(n) = args.nick {
         config.nick = n;
@@ -144,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (client, mut events) = Client::start(config, None);
     client.send(Command::Connect);
-    let mut ui = Ui { client, results: vec![], room: None, transfers: BTreeMap::new(), files: vec![] };
+    let mut ui = Ui { client, results: vec![], room: None, transfers: BTreeMap::new(), files: vec![], install_when_found: false };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
@@ -264,6 +282,10 @@ impl Ui {
                     _ => println!("usage: /hotlist add|rm <user>"),
                 }
             }
+            "update" => {
+                self.install_when_found = true;
+                c.send(Command::CheckForUpdate { manual: true });
+            }
             "raw" => {
                 let mut parts = rest.splitn(2, ' ');
                 match parts.next().and_then(|n| n.parse::<u16>().ok()) {
@@ -351,6 +373,30 @@ impl Ui {
             Event::ServerPong { millis } => println!("*** server pong: {millis} ms"),
             Event::Announcement { from, text } => println!("*** [announcement] {from}: {text}"),
             Event::ChannelInvite { from, channel } => println!("*** {from} invites you to {channel}"),
+            Event::UpdateAvailable(info) => {
+                if std::mem::take(&mut self.install_when_found) {
+                    println!("*** installing napster-rs {} ...", info.version);
+                    self.client.send(Command::InstallUpdate(info));
+                } else {
+                    println!(
+                        "*** napster-rs {} is available (you have {}). Type /update to install it.",
+                        info.version,
+                        napster_core::update::current_version()
+                    );
+                }
+            }
+            Event::UpToDate => {
+                self.install_when_found = false;
+                println!("*** you have the latest version ({})", napster_core::update::current_version());
+            }
+            Event::UpdateProgress(msg) => println!("*** {msg}"),
+            Event::UpdateInstalled { version, .. } => {
+                println!("*** updated to {version}; restart napster-cli to use it")
+            }
+            Event::UpdateFailed(e) => {
+                self.install_when_found = false;
+                println!("!!! update failed: {e}");
+            }
         }
     }
 }
