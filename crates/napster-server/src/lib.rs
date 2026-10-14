@@ -2,6 +2,7 @@
 //! (redirector) that the original client contacts first.
 
 pub mod db;
+pub mod discover;
 mod guard;
 pub mod link;
 mod session;

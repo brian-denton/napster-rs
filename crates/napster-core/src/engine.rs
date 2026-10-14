@@ -56,6 +56,8 @@ pub(crate) struct Shared {
     /// Is the server we're logged in to on a local network? (Unknown
     /// counts as no, e.g. a host name only the proxy resolved.)
     pub server_local: Mutex<bool>,
+    /// The server announced the Discover extension.
+    pub discover: Mutex<bool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -264,6 +266,7 @@ impl Client {
             down_throttle: Throttle::default(),
             up_throttle: Throttle::default(),
             server_local: Mutex::new(true),
+            discover: Mutex::new(false),
         });
         tokio::spawn(Actor::new(shared, rx).run());
         (Client { tx }, erx)
@@ -290,6 +293,11 @@ struct Actor {
     channel_users: HashMap<String, Vec<ChannelUser>>,
     /// accumulating 618s until 617
     channel_list: Vec<(String, u32, String)>,
+    /// Discover answers being collected until their end marker
+    genres: Vec<GenreInfo>,
+    genre_files: Vec<SearchResult>,
+    charts: Charts,
+    members: Vec<Member>,
 }
 
 impl Actor {
@@ -302,6 +310,10 @@ impl Actor {
             scan_cancel: None,
             channel_users: HashMap::new(),
             channel_list: Vec::new(),
+            genres: Vec::new(),
+            genre_files: Vec::new(),
+            charts: Charts::default(),
+            members: Vec::new(),
         }
     }
 
@@ -489,6 +501,30 @@ impl Actor {
                     s.emit(Event::Error("Not connected to Server!".into()));
                 }
             }
+            Command::DiscoverGenres
+            | Command::DiscoverGenre(_)
+            | Command::DiscoverCharts
+            | Command::DiscoverMembers
+                if !*lock(&s.discover) =>
+            {
+                s.emit(Event::DiscoverUnavailable);
+            }
+            Command::DiscoverGenres => {
+                self.genres.clear();
+                s.send(msg::DISCOVER_GENRES, "");
+            }
+            Command::DiscoverGenre(g) => {
+                self.genre_files.clear();
+                s.send(msg::DISCOVER_GENRE, quote(&g));
+            }
+            Command::DiscoverCharts => {
+                self.charts = Charts::default();
+                s.send(msg::DISCOVER_CHARTS, "");
+            }
+            Command::DiscoverMembers => {
+                self.members.clear();
+                s.send(msg::DISCOVER_MEMBERS, "");
+            }
             Command::CheckForUpdate { manual } => self.check_update(manual),
             Command::InstallUpdate(info) => {
                 let s = s.clone();
@@ -652,6 +688,9 @@ impl Actor {
             match m.kind {
                 msg::LOGIN_ACK => break m.data,
                 msg::ERROR => bail!("Unable to login: {}", m.data),
+                // before the ack, so it's known by the time we're online
+                // and the first shares carry their tags
+                msg::CAPABILITIES => *lock(&self.shared.discover) = m.data.split_whitespace().any(|c| c == "discover"),
                 other => tracing::debug!("pre-login message {other}: {}", m.data),
             }
         };
@@ -689,6 +728,7 @@ impl Actor {
 
     fn disconnected(&mut self, why: &str) {
         let was = lock(&self.shared.server).take().is_some();
+        *lock(&self.shared.discover) = false;
         self.reader = None;
         if !was {
             return;
@@ -912,6 +952,53 @@ impl Actor {
             msg::LIST_CHANNELS => {
                 s.emit(Event::ChannelList(std::mem::take(&mut self.channel_list)));
             }
+            msg::CAPABILITIES => {
+                // a late announcement: tag what's already shared
+                let on = m.data.split_whitespace().any(|c| c == "discover");
+                if on && !std::mem::replace(&mut *lock(&s.discover), true) {
+                    share_meta(&s, &s.library());
+                }
+            }
+            msg::GENRE_ENTRY => {
+                let name = a.str().unwrap_or("").to_owned();
+                let files = a.num().unwrap_or(0);
+                let users = a.num().unwrap_or(0);
+                self.genres.push(GenreInfo { name, files, users });
+            }
+            msg::DISCOVER_GENRES => s.emit(Event::Genres(std::mem::take(&mut self.genres))),
+            msg::GENRE_FILE => {
+                if let Some(r) = SearchResult::parse(&m.data) {
+                    self.genre_files.push(r);
+                }
+            }
+            msg::DISCOVER_GENRE => {
+                let genre = a.str().unwrap_or("").to_owned();
+                s.emit(Event::GenreFiles { genre, files: std::mem::take(&mut self.genre_files) });
+            }
+            msg::CHART_ENTRY => {
+                let chart = a.str().unwrap_or("").to_owned();
+                let count = a.num().unwrap_or(0);
+                let text = a.str().unwrap_or("").to_owned();
+                let entry = ChartEntry { text, count };
+                match chart.as_str() {
+                    "songs" => self.charts.songs.push(entry),
+                    "searches" => self.charts.searches.push(entry),
+                    "artists" => self.charts.artists.push(entry),
+                    _ => {}
+                }
+            }
+            msg::DISCOVER_CHARTS => s.emit(Event::Charts(std::mem::take(&mut self.charts))),
+            msg::MEMBER_ENTRY => {
+                let list = |s: &str| s.split("; ").filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
+                let nick = a.str().unwrap_or("").to_owned();
+                let matching = a.num().unwrap_or(0);
+                let files = a.num().unwrap_or(0);
+                let link_speed = a.num().unwrap_or(0);
+                let common = list(a.str().unwrap_or(""));
+                let favorites = list(a.str().unwrap_or(""));
+                self.members.push(Member { nick, matching, files, link_speed, common, favorites });
+            }
+            msg::DISCOVER_MEMBERS => s.emit(Event::Members(std::mem::take(&mut self.members))),
             msg::CHANNEL_INVITE => {
                 let from = a.str().unwrap_or("").to_owned();
                 let channel = a.str().unwrap_or("").to_owned();
@@ -1015,7 +1102,26 @@ fn share_all(s: &Shared, lib: &Library) {
     for f in lib.files() {
         s.send(msg::SHARE_FILE, f.info.to_share());
     }
+    if *lock(&s.discover) {
+        share_meta(s, lib);
+    }
     s.emit(Event::Status(format!("Online ({}): Sharing {} files.", s.my_nick(), lib.len())));
+}
+
+/// Tell a Discover-capable server our files' artists, titles and genres.
+fn share_meta(s: &Shared, lib: &Library) {
+    for f in lib.files().iter().filter(|f| !f.meta.is_empty()) {
+        s.send(
+            msg::SHARE_META,
+            format!(
+                "{} {} {} {}",
+                quote(&f.info.filename),
+                quote(&f.meta.artist),
+                quote(&f.meta.title),
+                quote(&f.meta.genre)
+            ),
+        );
+    }
 }
 
 fn channel_user(a: &mut napster_proto::Args<'_>) -> Option<ChannelUser> {

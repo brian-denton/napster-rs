@@ -11,12 +11,13 @@ the Library with its built-in player.
 ![Search](docs/screenshots/search.png)
 ![Transfer: two downloads sharing a 56K user's 3.5 KB/s upload](docs/screenshots/transfer.png)
 ![Library and the built-in player](docs/screenshots/player.png)
+![Discover: Members' Collections, ranked by how much their music overlaps yours](docs/screenshots/discover.png)
 ![Chat](docs/screenshots/chat.png)
 
 | Crate | Binary | What it is |
 |---|---|---|
 | `napster-proto` | | Wire protocol: frame codec, message numbers, field tokenizer, search grammar, and the peer `GET`/`SEND`/`GETLIST` handshakes |
-| `napster-server` | `napd` | Server and metaserver: accounts, sharing and search, transfer brokering (including firewalled push), chat rooms, hot lists, whois, moderation, TLS, and linking servers into one network |
+| `napster-server` | `napd` | Server and metaserver: accounts, sharing and search, transfer brokering (including firewalled push), chat rooms, hot lists, whois, moderation, TLS, Discover (genres, live charts, members' collections), and linking servers into one network |
 | `napster-core` | | Client engine: login (plain, TLS or via SOCKS5), library scan (MP3 parsing and Napster MD5), downloads and uploads with resume, push transfers, direct browse, period-accurate speeds, signed self-update |
 | `napster-gui` | `napster` | Desktop client (egui) with the original's tabs: Home, Chat, Library and player, Search, Hot List, Transfer, Discover and Help |
 | `napster-cli` | `napster-cli` | Line-based client over the same engine |
@@ -172,9 +173,42 @@ Settings are stored in `%APPDATA%\napster-rs\config.json`, which is shared
 with the CLI. Remembered server certificates are in `known_servers.json`
 in the same folder.
 
+To find a chat room, click **Join Chat Rooms...** in the Chat tab (or use
+the Actions menu). Double-click a room to join it, or type a name next to
+**Create**.
+
 Chat boxes accept IRC-style commands such as `/join`, `/msg`, `/me`,
 `/whois`, `/browse`, `/ping` and `/raw <numeric> <data>`. Type `/help` for
 the full list.
+
+### Discover
+
+The **Discover** tab is for finding new music. It has three sections:
+
+* **Browse Genres:** every genre being shared right now, with how many
+  files and users each has. Click a genre to list its songs, then
+  double-click one or use **Get Selected Song(s)** to download it.
+* **Live Charts:** three charts covering the last 24 hours, refreshed
+  every 30 seconds while you're looking:
+  * **Most Requested Songs:** the most downloaded songs.
+  * **Hot Searches:** what people are searching for.
+  * **Most Shared Artists:** artists in the most users' libraries.
+
+  Double-click any entry to search for it.
+* **Members' Collections:** users whose music is most like yours, with a
+  match score, the artists you have in common and their favorites.
+  Double-click a member to browse their collection, or add them to your
+  Hot List or send them a message. Until you share tagged music, it lists
+  the biggest collections instead.
+
+Discover reads the artist, title and genre from each song's ID3 tag (v1,
+v2.2, v2.3 or v2.4). For an untagged file named `Artist - Title.mp3`, the
+name is used and the genre is left blank. Only the tags are sent to the
+server: the audio and your folders stay private.
+
+Discover is a napster-rs feature of `napd`. On other servers the tab says
+it isn't available. It covers users on the server you're connected to,
+not users on linked servers.
 
 ### The player
 
@@ -198,7 +232,8 @@ napster-cli --server myhost:8888 --nick bob --password pw --share D:\Music
 ```
 
 Then use `/search beatles`, `/get 1 2`, `/transfers`, `/join Lobby`, and so
-on. `/help` lists everything.
+on. Discover is there too: `/genres`, `/genre Rock` (results work with
+`/get`), `/charts` and `/members`. `/help` lists everything.
 
 ## Authentic 1999 speeds
 
@@ -282,6 +317,8 @@ servers and real client engines on loopback.
 * chat, private messages and hot-list notifications
 * login through the metaserver, including a wrong password
 * download speed caps and period-accurate line speeds
+* Discover: genres and genre files from ID3 tags, members ranked by
+  shared artists, and charts updated by searches and downloads
 
 `security.rs` covers:
 
@@ -352,7 +389,8 @@ NAPSTER_SNAPSHOT_DIR=shots napster --config test-user.json
 
 Add `NAPSTER_SNAPSHOT_PLAY=1` to start the player before the Library shot
 is taken. Only use it with silent test files: playback goes through your
-speakers.
+speakers. The Discover genre shot opens `NAPSTER_SNAPSHOT_GENRE`
+(default `Electronic`).
 
 ## Security
 

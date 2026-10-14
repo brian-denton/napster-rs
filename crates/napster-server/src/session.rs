@@ -1,6 +1,6 @@
 //! One client connection: login, then message dispatch.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -159,6 +159,7 @@ impl Conn {
                 | msg::UNSHARE_FILE
                 | msg::UNSHARE_ALL
                 | msg::SHARE_DIRECTORY
+                | msg::SHARE_META
                 | msg::HOTLIST_INIT
                 | msg::DOWNLOAD_START
                 | msg::DOWNLOAD_COMPLETE
@@ -371,10 +372,16 @@ impl Conn {
             cloaked: false,
             login_ms: crate::link::now_ms(),
             announced_shares: 0,
+            meta: HashMap::new(),
         };
         st.sessions.insert(key.clone(), session);
         self.nick = Some(acc.nick.clone());
 
+        // extension messages only go to clients that understand them; this
+        // one precedes the ack so the client knows before it's online
+        if st.session(&acc.nick).is_some_and(|s| s.client.starts_with("napster-rs")) {
+            self.reply(msg::CAPABILITIES, "discover");
+        }
         self.reply(msg::LOGIN_ACK, acc.email.clone());
         for line in &self.shared.config.motd {
             self.reply(msg::MOTD, line.clone());
@@ -430,7 +437,54 @@ impl Conn {
             msg::SHARE_FILE => self.share(&m),
             msg::SHARE_DIRECTORY => self.share_directory(&m),
             msg::UNSHARE_FILE => self.unshare(&m),
-            msg::UNSHARE_ALL => self.with_me(|s| s.files.clear()),
+            msg::UNSHARE_ALL => self.with_me(|s| {
+                s.files.clear();
+                s.meta.clear();
+            }),
+            msg::SHARE_META => self.share_meta(&m),
+            msg::DISCOVER_GENRES => {
+                let rows = crate::discover::genres(&self.shared.lock());
+                for (g, files, users) in rows {
+                    self.reply(msg::GENRE_ENTRY, format!("{} {files} {users}", quote(&g)));
+                }
+                self.reply(msg::DISCOVER_GENRES, "");
+            }
+            msg::DISCOVER_GENRE => {
+                let genre = m.args().str().unwrap_or("").to_owned();
+                let max = self.shared.config.max_results as usize * 2;
+                let files = crate::discover::genre_files(&self.shared.lock(), &genre, self.nick(), max);
+                for r in files {
+                    self.reply(msg::GENRE_FILE, r.to_payload());
+                }
+                self.reply(msg::DISCOVER_GENRE, quote(&genre));
+            }
+            msg::DISCOVER_CHARTS => {
+                let charts = crate::discover::charts(&self.shared.lock());
+                for (chart, rows) in charts {
+                    for (text, n) in rows {
+                        self.reply(msg::CHART_ENTRY, format!("{chart} {n} {}", quote(&text)));
+                    }
+                }
+                self.reply(msg::DISCOVER_CHARTS, "");
+            }
+            msg::DISCOVER_MEMBERS => {
+                let rows = crate::discover::members(&self.shared.lock(), self.nick(), 30);
+                for r in rows {
+                    self.reply(
+                        msg::MEMBER_ENTRY,
+                        format!(
+                            "{} {} {} {} {} {}",
+                            r.nick,
+                            r.matching,
+                            r.files,
+                            r.speed,
+                            quote(&r.common.join("; ")),
+                            quote(&r.favorites.join("; "))
+                        ),
+                    );
+                }
+                self.reply(msg::DISCOVER_MEMBERS, "");
+            }
             msg::SEARCH => self.search(&m),
             msg::DOWNLOAD_REQUEST => self.download_request(&m),
             msg::UPLOAD_ACCEPT => self.upload_accept(&m),
@@ -594,6 +648,18 @@ impl Conn {
         }
     }
 
+    /// SHARE_META `"<file>" "<artist>" "<title>" "<genre>"` for a shared file.
+    fn share_meta(&self, m: &Message) {
+        let mut a = m.args();
+        let file = a.str().unwrap_or("").to_owned();
+        let meta = crate::discover::Meta::new(a.str().unwrap_or(""), a.str().unwrap_or(""), a.str().unwrap_or(""));
+        self.with_me(|s| {
+            if s.files.iter().any(|f| f.filename == file) {
+                s.meta.insert(file, meta);
+            }
+        });
+    }
+
     fn add_shares(&mut self, files: Vec<napster_proto::FileInfo>) {
         let max = self.shared.config.max_shares;
         let mut over = false;
@@ -628,7 +694,10 @@ impl Conn {
 
     fn unshare(&self, m: &Message) {
         let name = m.args().str().unwrap_or("").to_owned();
-        self.with_me(|s| s.files.retain(|f| f.filename != name));
+        self.with_me(|s| {
+            s.files.retain(|f| f.filename != name);
+            s.meta.remove(&name);
+        });
     }
 
     fn search(&self, m: &Message) {
@@ -642,6 +711,7 @@ impl Conn {
         };
         let words = q.words();
         let max = q.max_results.min(self.shared.config.max_results) as usize;
+        self.shared.lock().trends.search(q.terms.join(" ").trim().to_owned());
         let me = self.key();
         let mut st = self.shared.lock();
         let mut n = 0;
@@ -708,7 +778,13 @@ impl Conn {
         let mut a = m.args();
         let target = a.str().unwrap_or("").to_owned();
         let file = a.str().unwrap_or("").to_owned();
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
+        // every download request counts toward the "most requested" chart
+        let label = match st.session(&target) {
+            Some(up) => crate::discover::song_label(up, &file),
+            None => crate::discover::file_label(&file),
+        };
+        st.trends.download(label);
         if st.forward(&target, self.nick(), m) {
             return;
         }

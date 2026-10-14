@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "napster-cli"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "napster-core"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2518,7 +2518,7 @@ dependencies = [
 
 [[package]]
 name = "napster-gui"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "napster-proto"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "napster-server"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "napster-sign"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",

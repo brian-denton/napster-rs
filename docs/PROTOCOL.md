@@ -203,6 +203,41 @@ If two servers accept the same nick at the same moment, the earlier login
 wins. Ties go to the alphabetically lower server name. Both servers apply
 the same rule, so they agree on who keeps the nick.
 
+## Discover (napster-rs extension)
+
+The Discover tab uses messages from 11000 to 11099. `napd` only sends them
+to clients whose client string starts with `napster-rs`, so the original
+client never sees them. Right before LOGIN_ACK (3), `napd` sends
+CAPABILITIES. A client that sees `discover` in it sends a SHARE_META for
+each tagged file after its shares.
+
+| Type | Name | Direction | Payload |
+|---|---|---|---|
+| 11099 | CAPABILITIES | server → client | space-separated features, e.g. `discover` |
+| 11010 | SHARE_META | client → server | `"<shared filename>" "<artist>" "<title>" "<genre>"` |
+| 11000 | DISCOVER_GENRES | both | client: empty request. Server: ends the list |
+| 11001 | GENRE_ENTRY | server → client | `"<genre>" <files> <users>` |
+| 11002 | DISCOVER_GENRE | both | client: `"<genre>"`. Server: `"<genre>"`, ends the list |
+| 11003 | GENRE_FILE | server → client | a 201 search-result payload |
+| 11004 | DISCOVER_CHARTS | both | client: empty request. Server: ends the charts |
+| 11005 | CHART_ENTRY | server → client | `<songs\|searches\|artists> <count> "<text>"` |
+| 11006 | DISCOVER_MEMBERS | both | client: empty request. Server: ends the list |
+| 11007 | MEMBER_ENTRY | server → client | `<nick> <match%> <files> <speed> "<common; ...>" "<favorites; ...>"` |
+
+How the server builds the data:
+
+* **Tags:** kept per session only, and dropped when a file is unshared or
+  the user logs off. A SHARE_META for a file that isn't shared is
+  ignored. Fields are clipped to 100 characters.
+* **Songs chart:** download requests (203) seen in the last 24 hours.
+  Each is labelled `Artist - Title` from the uploader's tags, or with the
+  file name when there are none.
+* **Searches chart:** the search terms (200) seen in the last 24 hours.
+* **Artists chart:** how many users currently share each artist.
+* **Members:** the Jaccard similarity of the two users' artist sets,
+  ignoring "Unknown" and "Various Artists". Cloaked users and users
+  sharing nothing are left out.
+
 ## References
 
 * *napster messages* by drscholl (OpenNap):

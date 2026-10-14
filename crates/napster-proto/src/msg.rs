@@ -273,6 +273,31 @@ pub const LOGIN_911: u16 = 911;
 /// C: sent by b10 right before login with the payload `4`
 pub const PRE_LOGIN: u16 = 920;
 
+// ---- napster-rs extensions (Discover). Servers announce support with
+// CAPABILITIES, and clients only send these to servers that did, so the
+// 2001 client and other servers never see them.
+
+/// S: `discover ...` features this server supports
+pub const CAPABILITIES: u16 = 11099;
+/// C: `"<file>" "<artist>" "<title>" "<genre>"` tags for a shared file
+pub const SHARE_META: u16 = 11010;
+/// C: list genres / S: end of list
+pub const DISCOVER_GENRES: u16 = 11000;
+/// S: `"<genre>" <files> <users>`
+pub const GENRE_ENTRY: u16 = 11001;
+/// C: `"<genre>"` files in a genre / S: end `"<genre>"`
+pub const DISCOVER_GENRE: u16 = 11002;
+/// S: a file in the genre, same payload as 201
+pub const GENRE_FILE: u16 = 11003;
+/// C: charts / S: end of charts
+pub const DISCOVER_CHARTS: u16 = 11004;
+/// S: `<chart> <count> "<text>"`, chart = songs | searches | artists
+pub const CHART_ENTRY: u16 = 11005;
+/// C: members with similar taste / S: end of list
+pub const DISCOVER_MEMBERS: u16 = 11006;
+/// S: `<nick> <match%> <files> <speed> "<common artists>" "<favorite artists>"` (lists `; `-separated)
+pub const MEMBER_ENTRY: u16 = 11007;
+
 /// Human readable name for logging.
 pub fn name(kind: u16) -> &'static str {
     match kind {

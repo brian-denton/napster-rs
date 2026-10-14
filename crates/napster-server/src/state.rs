@@ -74,6 +74,8 @@ pub struct Session {
     pub login_ms: u64,
     /// Share count last announced to linked servers.
     pub announced_shares: u32,
+    /// Tags for shared files, by file name (napster-rs clients only).
+    pub meta: HashMap<String, crate::discover::Meta>,
 }
 
 impl Session {
@@ -130,6 +132,8 @@ pub struct State {
     pub remote: HashMap<String, crate::link::RemoteUser>,
     /// Searches waiting on linked servers.
     pub searches: HashMap<u64, crate::link::PendingSearch>,
+    /// Recent downloads and searches, for the Discover charts.
+    pub trends: crate::discover::Trends,
 }
 
 impl State {

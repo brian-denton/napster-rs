@@ -132,6 +132,46 @@ struct BrowseView {
     selected: HashSet<usize>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Genres,
+    Charts,
+    Members,
+}
+
+/// The Discover tab: genres, live charts, members' collections.
+struct DiscoverView {
+    section: Section,
+    unavailable: bool,
+    genres: Vec<napster_core::GenreInfo>,
+    genre: Option<String>,
+    genre_files: Vec<SearchResult>,
+    genre_selected: HashSet<usize>,
+    charts: napster_core::Charts,
+    charts_at: Option<std::time::Instant>,
+    members: Vec<napster_core::Member>,
+    member_selected: Option<usize>,
+    loading: bool,
+}
+
+impl Default for DiscoverView {
+    fn default() -> Self {
+        Self {
+            section: Section::Genres,
+            unavailable: false,
+            genres: vec![],
+            genre: None,
+            genre_files: vec![],
+            genre_selected: HashSet::new(),
+            charts: Default::default(),
+            charts_at: None,
+            members: vec![],
+            member_selected: None,
+            loading: false,
+        }
+    }
+}
+
 /// The update dialog's current step.
 enum UpdateStep {
     Available(napster_core::UpdateInfo),
@@ -183,6 +223,9 @@ pub struct App {
     force_splash: bool,
     player: crate::player::Player,
     update: Option<UpdateStep>,
+    discover: DiscoverView,
+    /// Chat tab is showing the room list.
+    show_rooms: bool,
     snap: Option<Snapshots>,
     snap_whois: Option<Vec<(String, String)>>,
 }
@@ -239,6 +282,8 @@ impl App {
             force_splash: false,
             player: crate::player::Player::default(),
             update: None,
+            discover: DiscoverView::default(),
+            show_rooms: false,
             snap: Snapshots::from_env(),
             snap_whois: None,
         };
@@ -309,7 +354,16 @@ impl App {
                     }
                     ConnState::Connecting => {}
                 }
+                let online = matches!(s, ConnState::Online { .. });
                 self.conn = s;
+                if online {
+                    // a new server: forget the last one's Discover data
+                    let section = self.discover.section;
+                    self.discover = DiscoverView { section, ..DiscoverView::default() };
+                    if self.tab == Tab::Discover {
+                        self.refresh_discover(false);
+                    }
+                }
             }
             Event::Status(s) => {
                 self.log(Line::sys(s.clone()));
@@ -391,6 +445,7 @@ impl App {
                 self.chat(key.clone(), &channel);
                 self.active_chat = Some(key);
                 self.tab = Tab::Chat;
+                self.show_rooms = false;
             }
             Event::Parted { channel } => {
                 self.chats.remove(&ChatKey::Channel(channel.to_lowercase()));
@@ -466,6 +521,31 @@ impl App {
             Event::Announcement { from, text } => self.log(Line::err(format!("* [Announcement] {from}: {text}"))),
             Event::ChannelInvite { from, channel } => {
                 self.log(Line::sys(format!("User {from} has invited you to a chat room! (/join {channel})")))
+            }
+            Event::Genres(g) => {
+                self.discover.genres = g;
+                self.discover.loading = false;
+            }
+            Event::GenreFiles { genre, files } => {
+                if self.discover.genre.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&genre)) {
+                    self.discover.genre_files = files;
+                    self.discover.genre_selected.clear();
+                }
+                self.discover.loading = false;
+            }
+            Event::Charts(c) => {
+                self.discover.charts = c;
+                self.discover.charts_at = Some(std::time::Instant::now());
+                self.discover.loading = false;
+            }
+            Event::Members(m) => {
+                self.discover.members = m;
+                self.discover.member_selected = None;
+                self.discover.loading = false;
+            }
+            Event::DiscoverUnavailable => {
+                self.discover.unavailable = true;
+                self.discover.loading = false;
             }
             Event::UpdateAvailable(info) => {
                 if self.snap.is_none() {
@@ -743,8 +823,7 @@ impl App {
                     });
                     ui.menu_button("Actions", |ui| {
                         if ui.button("Join Chat Rooms").clicked() {
-                            self.tab = Tab::Discover;
-                            self.client.send(Command::ListChannels);
+                            self.open_rooms();
                             ui.close_menu();
                         }
                         if ui.button("View Ignore List").clicked() {
@@ -808,8 +887,8 @@ impl App {
                     for (tab, icon, label) in tabs {
                         if classic::tab_button(ui, icon, label, self.tab == tab).clicked() {
                             self.tab = tab;
-                            if tab == Tab::Discover && self.online() {
-                                self.client.send(Command::ListChannels);
+                            if tab == Tab::Discover {
+                                self.refresh_discover(false);
                             }
                         }
                     }
@@ -969,12 +1048,19 @@ impl App {
                 }
             }
             ui.add_space(8.0);
-            if classic::button(ui, "Join Chat Rooms...", None).clicked() {
-                self.tab = Tab::Discover;
-                self.client.send(Command::ListChannels);
+            if classic::button_ex(ui, "Join Chat Rooms...", None, true, self.show_rooms).clicked() {
+                if self.show_rooms {
+                    self.show_rooms = false;
+                } else {
+                    self.open_rooms();
+                }
             }
         });
         ui.add_space(4.0);
+        if self.show_rooms || self.chats.is_empty() {
+            self.rooms_panel(ui);
+            return;
+        }
         let Some(key) = self.active_chat.clone() else {
             let (w, h) = (ui.available_width(), ui.available_height());
             classic::sunken(ui, vec2(w, h), Color32::WHITE, |ui| {
@@ -1779,7 +1865,326 @@ impl App {
         });
     }
 
+    fn open_rooms(&mut self) {
+        self.tab = Tab::Chat;
+        self.show_rooms = true;
+        if self.online() {
+            self.client.send(Command::ListChannels);
+        }
+    }
+
+    /// Ask the server for the current Discover section (charts refresh
+    /// every 30 seconds while shown; `force` refreshes now).
+    fn refresh_discover(&mut self, force: bool) {
+        if !self.online() || self.discover.unavailable {
+            return;
+        }
+        let d = &mut self.discover;
+        let cmd = match d.section {
+            Section::Genres if force || d.genres.is_empty() => Some(Command::DiscoverGenres),
+            Section::Charts if force || d.charts_at.is_none_or(|t| t.elapsed().as_secs() >= 30) => {
+                d.charts_at = Some(std::time::Instant::now());
+                Some(Command::DiscoverCharts)
+            }
+            Section::Members if force || d.members.is_empty() => Some(Command::DiscoverMembers),
+            _ => None,
+        };
+        if let Some(c) = cmd {
+            d.loading = true;
+            self.client.send(c);
+        }
+        if force {
+            if let (Section::Genres, Some(g)) = (self.discover.section, self.discover.genre.clone()) {
+                self.client.send(Command::DiscoverGenre(g));
+            }
+        }
+    }
+
+    /// Search for `text` in the Search tab.
+    fn search_for(&mut self, artist: &str, title: &str) {
+        self.search.artist = artist.to_owned();
+        self.search.title = title.to_owned();
+        self.tab = Tab::Search;
+        self.start_search();
+    }
+
     fn discover_tab(&mut self, ui: &mut Ui) {
+        let mut switch = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (sec, label) in [
+                (Section::Genres, "Browse Genres"),
+                (Section::Charts, "Live Charts"),
+                (Section::Members, "Members' Collections"),
+            ] {
+                if classic::button_ex(ui, label, Some(170.0), true, self.discover.section == sec).clicked() {
+                    switch = Some(sec);
+                }
+            }
+            ui.add_space(12.0);
+            if classic::button(ui, "Refresh", Some(90.0)).clicked() {
+                self.refresh_discover(true);
+            }
+            if self.discover.loading {
+                ui.spinner();
+            }
+        });
+        if let Some(sec) = switch {
+            self.discover.section = sec;
+            self.refresh_discover(false);
+        }
+        ui.add_space(4.0);
+        if !self.online() || self.discover.unavailable {
+            let (w, h) = (ui.available_width(), ui.available_height());
+            let text = if !self.online() {
+                "Not connected to Server! Use File > Connect, then come back to Discover new music."
+            } else {
+                "This server doesn't offer Discover. It's a napster-rs (napd) feature: genres, live charts and \
+                 members' collections are built from what napster-rs users share and search for."
+            };
+            classic::sunken(ui, vec2(w, h), Color32::WHITE, |ui| {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(w - 80.0);
+                    ui.label(text);
+                });
+            });
+            return;
+        }
+        match self.discover.section {
+            Section::Genres => self.genres_view(ui),
+            Section::Charts => {
+                // "live": keep the charts fresh while they're on screen
+                self.refresh_discover(false);
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
+                self.charts_view(ui);
+            }
+            Section::Members => self.members_view(ui),
+        }
+    }
+
+    fn genres_view(&mut self, ui: &mut Ui) {
+        let h = ui.available_height() - 58.0;
+        let mut pick: Option<String> = None;
+        let mut get: Vec<SearchResult> = vec![];
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(260.0);
+                let genres = &self.discover.genres;
+                let current = self.discover.genre.clone();
+                let out = list_view(
+                    ui,
+                    "genres",
+                    h + 28.0,
+                    &[("Genre", 0.0), ("Files", 50.0), ("Users", 50.0)],
+                    genres.len(),
+                    |i| current.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(&genres[i].name)),
+                    |ui, i, c, sel| {
+                        let g = &genres[i];
+                        let t = match c {
+                            0 => g.name.clone(),
+                            1 => commas(g.files as u64),
+                            _ => g.users.to_string(),
+                        };
+                        classic::cell(ui, t, sel);
+                    },
+                    None,
+                );
+                if let Some(i) = out.clicked.or(out.double).or(out.secondary) {
+                    pick = Some(genres[i].name.clone());
+                }
+                if genres.is_empty() && !self.discover.loading {
+                    ui.label(RichText::new("No tagged music is being shared yet.").color(classic::DISABLED));
+                }
+            });
+            ui.vertical(|ui| {
+                let w = ui.available_width();
+                let title = match &self.discover.genre {
+                    Some(g) => format!("{g} — {} files", commas(self.discover.genre_files.len() as u64)),
+                    None => "Pick a genre to see what people are sharing".into(),
+                };
+                classic::status_panel(ui, &title, w);
+                ui.add_space(2.0);
+                let files = &self.discover.genre_files;
+                let selected = &self.discover.genre_selected;
+                let out = list_view(
+                    ui,
+                    "genre_files",
+                    h,
+                    &[("Filename", 0.0), ("User", 100.0), ("Bitrate", 50.0), ("Length", 50.0), ("Connection", 80.0)],
+                    files.len(),
+                    |i| selected.contains(&i),
+                    |ui, i, c, sel| {
+                        let r = &files[i];
+                        let t = match c {
+                            0 => r.file.basename().to_owned(),
+                            1 => r.nick.clone(),
+                            2 => dash(r.file.bitrate),
+                            3 => duration(r.file.seconds),
+                            _ => link_speed_name(r.link_speed).to_owned(),
+                        };
+                        classic::cell(ui, t, sel);
+                    },
+                    None,
+                );
+                if let Some(i) = out.double {
+                    get.push(files[i].clone());
+                } else if let Some(i) = out.clicked {
+                    toggle_select(ui, &mut self.discover.genre_selected, i);
+                } else if let Some(i) = out.secondary {
+                    self.discover.genre_selected = HashSet::from([i]);
+                }
+                ui.add_space(3.0);
+                let any = !self.discover.genre_selected.is_empty();
+                let w = ui.available_width();
+                if classic::button_ex(ui, "Get Selected Song(s)", Some(w), any, false).clicked() {
+                    get.extend(self.discover.genre_selected.iter().map(|&i| self.discover.genre_files[i].clone()));
+                    self.discover.genre_selected.clear();
+                }
+            });
+        });
+        for r in get {
+            self.download(&r);
+        }
+        if let Some(g) = pick {
+            if self.discover.genre.as_deref() != Some(g.as_str()) {
+                self.discover.genre = Some(g.clone());
+                self.discover.genre_files.clear();
+                self.discover.loading = true;
+                self.client.send(Command::DiscoverGenre(g));
+            }
+        }
+    }
+
+    fn charts_view(&mut self, ui: &mut Ui) {
+        let total = ui.available_width();
+        let w = (total - 12.0) / 3.0;
+        let h = ui.available_height() - 52.0;
+        let mut search: Option<(String, String)> = None;
+        ui.horizontal_top(|ui| {
+            let c = &self.discover.charts;
+            for (id, title, rows, unit) in [
+                ("chart_songs", "Most Requested Songs", &c.songs, "Requests"),
+                ("chart_searches", "Hot Searches", &c.searches, "Searches"),
+                ("chart_artists", "Most Shared Artists", &c.artists, "Members"),
+            ] {
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    classic::status_panel(ui, title, w);
+                    ui.add_space(2.0);
+                    let out = list_view(
+                        ui,
+                        id,
+                        h,
+                        &[("#", 26.0), (title_column(id), 0.0), (unit, 70.0)],
+                        rows.len(),
+                        |_| false,
+                        |ui, i, col, sel| {
+                            let e = &rows[i];
+                            let t = match col {
+                                0 => (i + 1).to_string(),
+                                1 => e.text.clone(),
+                                _ => e.count.to_string(),
+                            };
+                            classic::cell(ui, t, sel);
+                        },
+                        None,
+                    );
+                    if let Some(i) = out.double {
+                        let text = rows[i].text.clone();
+                        search = Some(match (id, text.split_once(" - ")) {
+                            ("chart_songs", Some((artist, title))) => (artist.to_owned(), title.to_owned()),
+                            ("chart_artists", _) => (text, String::new()),
+                            _ => (text, String::new()),
+                        });
+                    }
+                });
+            }
+        });
+        let when = self
+            .discover
+            .charts_at
+            .map(|t| format!("Live: last 24 hours, updated {} seconds ago.", t.elapsed().as_secs()))
+            .unwrap_or_default();
+        classic::info_bar(ui, &format!("{when}   Double-click an entry to search for it."));
+        if let Some((artist, title)) = search {
+            self.search_for(&artist, &title);
+        }
+    }
+
+    fn members_view(&mut self, ui: &mut Ui) {
+        let h = ui.available_height() - 58.0;
+        let members = &self.discover.members;
+        let selected = self.discover.member_selected;
+        let out = list_view(
+            ui,
+            "members",
+            h,
+            &[
+                ("Member", 110.0),
+                ("Match", 70.0),
+                ("In Common", 0.0),
+                ("Favorite Artists", 260.0),
+                ("Files", 60.0),
+                ("Connection", 80.0),
+            ],
+            members.len(),
+            |i| selected == Some(i),
+            |ui, i, c, sel| {
+                let m = &members[i];
+                match c {
+                    0 => {
+                        classic::cell(ui, &m.nick, sel);
+                    }
+                    1 => classic::progress(ui, m.matching as f32 / 100.0, classic::BAR_BLUE, 60.0),
+                    2 => {
+                        classic::cell(ui, m.common.join(", "), sel);
+                    }
+                    3 => {
+                        classic::cell(ui, m.favorites.join(", "), sel);
+                    }
+                    4 => {
+                        classic::cell(ui, commas(m.files as u64), sel);
+                    }
+                    _ => {
+                        classic::cell(ui, link_speed_name(m.link_speed), sel);
+                    }
+                }
+            },
+            None,
+        );
+        if let Some(i) = out.clicked.or(out.secondary) {
+            self.discover.member_selected = Some(i);
+        }
+        let mut action: Option<(String, &'static str)> = None;
+        if let Some(i) = out.double {
+            action = Some((members[i].nick.clone(), "browse"));
+        }
+        let text = if self.discover.members.is_empty() {
+            "No members to suggest yet: share some tagged music, or wait for more people to log on.".to_owned()
+        } else {
+            "Members whose collections overlap yours, best match first. Double-click to browse a collection.".to_owned()
+        };
+        classic::info_bar(ui, &text);
+        ui.add_space(3.0);
+        let nick = self.discover.member_selected.and_then(|i| self.discover.members.get(i)).map(|m| m.nick.clone());
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 12.0) / 3.0;
+            for (label, what) in
+                [("Browse Collection", "browse"), ("Add to Hot List", "hotlist"), ("Instant Message", "msg")]
+            {
+                if classic::button_ex(ui, label, Some(w), nick.is_some(), false).clicked() {
+                    action = nick.clone().map(|n| (n, what));
+                }
+            }
+        });
+        if let Some((n, what)) = action {
+            self.user_action(&n, what);
+        }
+    }
+
+    /// The chat room list (Chat tab > Join Chat Rooms...).
+    fn rooms_panel(&mut self, ui: &mut Ui) {
         classic::status_panel(ui, "Chat Rooms", ui.available_width());
         ui.add_space(2.0);
         let rows = &self.channel_list;
@@ -2229,6 +2634,12 @@ impl App {
                         self.client.send(Command::Whois(r.nick.clone()));
                     }
                     self.search.selected.insert(1);
+                    // Discover data for its shots (the downloads above feed the charts)
+                    let genre = std::env::var("NAPSTER_SNAPSHOT_GENRE").unwrap_or_else(|_| "Electronic".into());
+                    self.discover.genre = Some(genre.clone());
+                    self.client.send(Command::DiscoverGenres);
+                    self.client.send(Command::DiscoverGenre(genre));
+                    self.client.send(Command::DiscoverMembers);
                     s.go(Phase::Settling);
                 }
             }
@@ -2245,6 +2656,8 @@ impl App {
                     }
                 }
                 if s.elapsed().as_millis() > 2500 {
+                    self.discover.charts_at = Some(std::time::Instant::now());
+                    self.client.send(Command::DiscoverCharts);
                     s.go(Phase::Show(0));
                 }
             }
@@ -2258,6 +2671,7 @@ impl App {
                     Shot::Home => self.tab = Tab::Home,
                     Shot::Chat | Shot::Whois => {
                         self.tab = Tab::Chat;
+                        self.show_rooms = false;
                         // show the member-list highlight on someone else
                         let me = self.my_nick().to_lowercase();
                         if let Some(v) = self.active_chat.clone().and_then(|k| self.chats.get_mut(&k)) {
@@ -2272,7 +2686,21 @@ impl App {
                         self.tab = Tab::Transfer;
                         self.selected_transfer = self.transfers.keys().next().copied();
                     }
-                    Shot::Discover => self.tab = Tab::Discover,
+                    Shot::Discover | Shot::DiscoverCharts | Shot::DiscoverMembers => {
+                        self.tab = Tab::Discover;
+                        self.discover.section = match shot {
+                            Shot::DiscoverCharts => Section::Charts,
+                            Shot::DiscoverMembers => Section::Members,
+                            _ => Section::Genres,
+                        };
+                        self.discover.genre_selected = HashSet::from([0]);
+                        self.discover.member_selected = Some(0);
+                    }
+                    Shot::ChatRooms => {
+                        self.tab = Tab::Chat;
+                        self.show_rooms = true;
+                        self.client.send(Command::ListChannels);
+                    }
                     Shot::SearchWide => {
                         // the table must follow a window resize after it was first laid out
                         self.tab = Tab::Search;
@@ -2559,6 +2987,14 @@ fn display_name(name: &str) -> &str {
     }
 }
 
+fn title_column(id: &str) -> &'static str {
+    match id {
+        "chart_songs" => "Song",
+        "chart_searches" => "Search",
+        _ => "Artist",
+    }
+}
+
 fn status_label(t: &TransferInfo) -> String {
     match (&t.state, t.direction) {
         (TransferState::Queued, _) => "Queued".into(),
@@ -2661,7 +3097,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "Chat",
-        "Join rooms from Discover (or Join Chat Rooms...). Commands: /join <room>, /part, /msg <user> <text>, \
+        "Join rooms with the Join Chat Rooms... button. Commands: /join <room>, /part, /msg <user> <text>, \
          /me <action>, /topic <text>, /whois <user>, /ping <user>, /serverping, /browse <user>, /ignore <user>, \
          /unignore <user>, /hotlist <user>, /clear, /raw <numeric> <data>.",
     ),

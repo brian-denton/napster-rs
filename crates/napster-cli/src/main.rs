@@ -81,6 +81,9 @@ commands:
   /join <room>  /part [room]  /rooms  /me <action>  /topic <text>
   /msg <user> <text>  /whois <user>  /ping <user>
   /hotlist [add|rm <user>]
+  /genres  /genre <name>   browse music by genre (files numbered like search)
+  /charts                  live charts: most requested, hot searches, top artists
+  /members                 members whose collections are like yours
   /raw <numeric> <data>
   /update                  check for a new version and install it
 anything else is said in the current room.";
@@ -238,6 +241,13 @@ impl Ui {
                 self.results.clear();
                 c.send(Command::Browse(arg));
             }
+            "genres" => c.send(Command::DiscoverGenres),
+            "genre" => {
+                self.results.clear();
+                c.send(Command::DiscoverGenre(rest.to_owned()));
+            }
+            "charts" => c.send(Command::DiscoverCharts),
+            "members" => c.send(Command::DiscoverMembers),
             "get" | "g" => {
                 for n in rest.split_whitespace().filter_map(|n| n.parse::<usize>().ok()) {
                     match self.results.get(n.wrapping_sub(1)) {
@@ -353,6 +363,55 @@ impl Ui {
                     link_speed_name(r.link_speed)
                 );
             }
+            Event::Genres(g) => {
+                if g.is_empty() {
+                    println!("*** no tagged music is being shared yet");
+                }
+                for g in g {
+                    println!("  {:<24} {:>6} files  {:>4} users", g.name, g.files, g.users);
+                }
+            }
+            Event::GenreFiles { genre, files } => {
+                for r in files {
+                    self.results.push(r.clone());
+                    println!(
+                        "{:>3}. {}  [{} kbps, {}] {} ({})",
+                        self.results.len(),
+                        r.file.basename(),
+                        r.file.bitrate,
+                        secs(r.file.seconds),
+                        r.nick,
+                        link_speed_name(r.link_speed)
+                    );
+                }
+                println!("--- {} {genre} files (/get <n>)", self.results.len());
+            }
+            Event::Charts(c) => {
+                for (title, rows) in
+                    [("most requested", &c.songs), ("hot searches", &c.searches), ("most shared artists", &c.artists)]
+                {
+                    println!("--- {title} (24 hrs)");
+                    for (i, e) in rows.iter().enumerate() {
+                        println!("  {:>2}. {}  ({})", i + 1, e.text, e.count);
+                    }
+                }
+            }
+            Event::Members(m) => {
+                if m.is_empty() {
+                    println!("*** no members to suggest yet");
+                }
+                for m in m {
+                    println!(
+                        "  {:<16} {:>3}% match  {:>5} files  in common: {}  favorites: {}",
+                        m.nick,
+                        m.matching,
+                        m.files,
+                        m.common.join(", "),
+                        m.favorites.join(", ")
+                    );
+                }
+            }
+            Event::DiscoverUnavailable => println!("!!! this server doesn't offer Discover"),
             Event::SearchEnd => println!("--- {} results (/get <n>)", self.results.len()),
             Event::BrowseEnd { nick } => println!("--- {} files from {nick} (/get <n>)", self.results.len()),
             Event::Transfer(t) => {

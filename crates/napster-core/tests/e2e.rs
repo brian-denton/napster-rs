@@ -402,3 +402,120 @@ async fn browsing_yourself_is_refused() {
     let err = alice.wait(|e| if let Event::Error(e) = e { Some(e.clone()) } else { None }).await;
     assert!(err.contains("That's you"), "{err}");
 }
+
+fn tagged(artist: &str, title: &str, genre: &str) -> Vec<u8> {
+    let mut data = napster_core::tags::id3v2_tag(artist, title, genre);
+    data.extend(mp3::synth_mp3(40, 9));
+    data
+}
+
+impl Peer {
+    /// Send `cmd` until the reply satisfies `f` (tags reach the server just
+    /// after login, so the first answer can be early).
+    async fn discover<T>(&mut self, cmd: impl Fn() -> Command, mut f: impl FnMut(&Event) -> Option<T>) -> T {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            self.client.send(cmd());
+            let got = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let e = self.events.recv().await.expect("engine alive");
+                    if matches!(e, Event::Genres(_) | Event::GenreFiles { .. } | Event::Charts(_) | Event::Members(_)) {
+                        return f(&e);
+                    }
+                    assert!(!matches!(e, Event::DiscoverUnavailable), "server should offer Discover");
+                }
+            })
+            .await;
+            if let Ok(Some(t)) = got {
+                return t;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for discover data");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discover_genres_charts_and_members() {
+    let (server, _) = start_server().await;
+    let mut alice = Peer::new("alice", server, false).await;
+    let mut bob = Peer::new("bob", server, false).await;
+    let mut carol = Peer::new("carol", server, false).await;
+    // file names say nothing: genres and artists come from the ID3 tags
+    alice.share("track01.mp3", &tagged("Radiohead", "Karma Police", "Alternative"));
+    alice.share("track02.mp3", &tagged("Radiohead", "Creep", "Alternative"));
+    alice.share("track03.mp3", &tagged("Miles Davis", "So What", "Jazz"));
+    bob.share("a.mp3", &tagged("Radiohead", "Airbag", "Alternative"));
+    bob.share("b.mp3", &tagged("Beck", "Loser", "Alternative"));
+    carol.share("c.mp3", &tagged("Metallica", "One", "Metal"));
+    alice.rescan(3).await;
+    bob.rescan(2).await;
+    carol.rescan(1).await;
+    alice.connect().await;
+    bob.connect().await;
+    carol.connect().await;
+
+    // Browse Genres: every user's tagged files, grouped
+    let genres = bob
+        .discover(
+            || Command::DiscoverGenres,
+            |e| match e {
+                Event::Genres(g) if g.iter().map(|g| g.files).sum::<u32>() == 6 => Some(g.clone()),
+                _ => None,
+            },
+        )
+        .await;
+    assert_eq!(genres[0].name, "Alternative");
+    assert_eq!((genres[0].files, genres[0].users), (4, 2));
+    assert!(genres.iter().any(|g| g.name == "Jazz" && g.files == 1));
+    assert!(genres.iter().any(|g| g.name == "Metal" && g.files == 1));
+
+    // a genre's files are other people's, downloadable like search results
+    let files = bob
+        .discover(
+            || Command::DiscoverGenre("alternative".into()),
+            |e| match e {
+                Event::GenreFiles { files, .. } if files.len() == 2 => Some(files.clone()),
+                _ => None,
+            },
+        )
+        .await;
+    assert!(files.iter().all(|r| r.nick == "alice"), "{files:?}");
+
+    // Members' Collections: alice and bob share Radiohead (1 of 3 artists);
+    // carol has nothing in common with alice so isn't suggested
+    let members = alice
+        .discover(
+            || Command::DiscoverMembers,
+            |e| match e {
+                Event::Members(m) if !m.is_empty() => Some(m.clone()),
+                _ => None,
+            },
+        )
+        .await;
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members[0].nick, "bob");
+    assert_eq!(members[0].matching, 33);
+    assert_eq!(members[0].common, vec!["Radiohead".to_owned()]);
+    assert_eq!(members[0].files, 2);
+
+    // Live Charts: a search and a download (from the genre list) show up
+    // right away, the song under its tagged name
+    bob.search("karma").await;
+    let karma = files.iter().find(|r| r.file.filename.ends_with("track01.mp3")).expect("karma police").clone();
+    bob.download(&karma).await;
+    let charts = carol
+        .discover(
+            || Command::DiscoverCharts,
+            |e| match e {
+                Event::Charts(c) if !c.songs.is_empty() => Some(c.clone()),
+                _ => None,
+            },
+        )
+        .await;
+    assert_eq!(charts.songs[0].text, "Radiohead - Karma Police");
+    assert_eq!(charts.songs[0].count, 1);
+    assert!(charts.searches.iter().any(|s| s.text.eq_ignore_ascii_case("karma")), "{:?}", charts.searches);
+    assert_eq!(charts.artists[0].text, "Radiohead");
+    assert_eq!(charts.artists[0].count, 2);
+}

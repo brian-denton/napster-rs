@@ -54,6 +54,14 @@ pub enum Command {
     Unignore(String),
     /// Send an arbitrary message (for /raw and admin commands).
     Raw(u16, String),
+    /// Discover: genres on the server.
+    DiscoverGenres,
+    /// Discover: files in one genre.
+    DiscoverGenre(String),
+    /// Discover: live charts.
+    DiscoverCharts,
+    /// Discover: members whose collections resemble ours.
+    DiscoverMembers,
     /// Look for a newer release. `manual` also reports "up to date" and errors.
     CheckForUpdate {
         manual: bool,
@@ -159,6 +167,42 @@ pub struct ChannelUser {
     pub link_speed: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenreInfo {
+    pub name: String,
+    pub files: u32,
+    pub users: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChartEntry {
+    pub text: String,
+    pub count: u32,
+}
+
+/// Live charts over the last 24 hours.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Charts {
+    /// Most requested songs ("Artist - Title").
+    pub songs: Vec<ChartEntry>,
+    /// Most frequent searches.
+    pub searches: Vec<ChartEntry>,
+    /// Artists shared by the most users right now.
+    pub artists: Vec<ChartEntry>,
+}
+
+/// A user whose collection resembles yours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub nick: String,
+    /// 0-100: how much your artists overlap.
+    pub matching: u32,
+    pub files: u32,
+    pub link_speed: u32,
+    pub common: Vec<String>,
+    pub favorites: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     State(ConnState),
@@ -246,6 +290,16 @@ pub enum Event {
         from: String,
         channel: String,
     },
+    /// Discover answers.
+    Genres(Vec<GenreInfo>),
+    GenreFiles {
+        genre: String,
+        files: Vec<SearchResult>,
+    },
+    Charts(Charts),
+    Members(Vec<Member>),
+    /// The server doesn't support Discover (not napd).
+    DiscoverUnavailable,
     UpdateAvailable(UpdateInfo),
     /// Reply to a manual check when there's nothing newer.
     UpToDate,

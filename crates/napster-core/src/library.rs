@@ -23,6 +23,8 @@ pub const HASH_LEN: usize = 299_008;
 pub struct SharedFile {
     pub info: FileInfo,
     pub path: PathBuf,
+    /// Artist, title and genre from its tags (for Discover).
+    pub meta: crate::tags::TrackMeta,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +70,9 @@ struct CacheEntry {
     bitrate: u32,
     frequency: u32,
     seconds: u32,
+    /// artist, title, genre (absent in caches from before v0.6)
+    #[serde(default)]
+    tags: Option<(String, String, String)>,
 }
 
 fn cache_path() -> PathBuf {
@@ -215,8 +220,14 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
         let mtime =
             meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
         let key = path.to_string_lossy().into_owned();
-        if let Some(c) = cache.get(&key).filter(|c| c.size == meta.len() && c.mtime == mtime) {
+        if let Some(c) = cache.get_mut(&key).filter(|c| c.size == meta.len() && c.mtime == mtime) {
+            let tags = c.tags.get_or_insert_with(|| {
+                let t = crate::tags::read(&path);
+                (t.artist, t.title, t.genre)
+            });
+            let track = crate::tags::TrackMeta { artist: tags.0.clone(), title: tags.1.clone(), genre: tags.2.clone() };
             files.push(SharedFile {
+                meta: track,
                 info: FileInfo {
                     filename: name,
                     md5: c.md5.clone(),
@@ -232,6 +243,7 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
         match describe(&path) {
             Ok(Some(mut info)) => {
                 info.filename = name;
+                let track = crate::tags::read(&path);
                 cache.insert(
                     key,
                     CacheEntry {
@@ -241,9 +253,10 @@ pub fn scan(dirs: &[PathBuf], exts: &[String], use_cache: bool, mut progress: im
                         bitrate: info.bitrate,
                         frequency: info.frequency,
                         seconds: info.seconds,
+                        tags: Some((track.artist.clone(), track.title.clone(), track.genre.clone())),
                     },
                 );
-                files.push(SharedFile { info, path });
+                files.push(SharedFile { info, path, meta: track });
             }
             Ok(None) => tracing::debug!("skipping {}: not valid audio", path.display()),
             Err(e) => tracing::debug!("skipping {}: {e}", path.display()),

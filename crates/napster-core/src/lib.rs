@@ -9,6 +9,7 @@ mod engine;
 pub mod library;
 pub mod mp3;
 pub mod proxy;
+pub mod tags;
 mod throttle;
 pub mod tls;
 mod transfer;
