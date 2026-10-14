@@ -4,6 +4,13 @@ A Rust rewrite of the **Napster v2.0 BETA 10** Windows client, plus a server
 that makes it work again. The protocol was recovered from the original
 `napster.exe`; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+The desktop client recreates the look of the 2001 client: Windows 2000
+gray, bevelled buttons, the tab row, and the Search and Transfer windows.
+
+![Search](docs/screenshots/search.png)
+![Transfer](docs/screenshots/transfer.png)
+![Chat](docs/screenshots/chat.png)
+
 | Crate | Binary | What it is |
 |---|---|---|
 | `napster-proto` | | Wire protocol: frame codec, message numbers, field tokenizer, search grammar, and the peer `GET`/`SEND`/`GETLIST` handshakes |
@@ -115,6 +122,20 @@ The end-to-end tests in `crates/napster-core/tests/e2e.rs` start a real
 * direct browse, normal and firewalled
 * chat, private messages and hot-list notifications
 * login through the metaserver, including a wrong password
+
+### Screenshots of every screen
+
+Set `NAPSTER_SNAPSHOT_DIR` to make the GUI capture itself and exit. With
+this set, it:
+
+1. logs in using the given config
+2. searches for `NAPSTER_SNAPSHOT_SEARCH` (default `mp3`)
+3. starts a few downloads
+4. saves a PNG of every tab and dialog to that directory
+
+```bash
+NAPSTER_SNAPSHOT_DIR=shots napster --config test-user.json
+```
 
 ## Not implemented
 

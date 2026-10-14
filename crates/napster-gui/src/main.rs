@@ -3,6 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod classic;
+mod snapshot;
 
 use std::path::PathBuf;
 
@@ -26,8 +28,8 @@ fn main() -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Napster")
-            .with_inner_size([1040.0, 720.0])
+            .with_title("Napster v2.0 BETA 10 (napster-rs)")
+            .with_inner_size([960.0, 680.0])
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };

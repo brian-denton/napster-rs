@@ -33,6 +33,9 @@ struct Args {
     /// Data port for transfers; 0 = firewalled.
     #[arg(long)]
     data_port: Option<u16>,
+    /// Limit each upload to this many KB/s (0 = unlimited).
+    #[arg(long)]
+    upload_limit: Option<u32>,
     /// Interface for the data port listener (default 0.0.0.0).
     #[arg(long)]
     bind_host: Option<String>,
@@ -92,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(p) = args.data_port {
         config.data_port = p;
+    }
+    if let Some(l) = args.upload_limit {
+        config.upload_limit_kbps = l;
     }
     if let Some(h) = args.bind_host {
         config.bind_host = h;

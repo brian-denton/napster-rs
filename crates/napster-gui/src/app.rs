@@ -1,22 +1,28 @@
-//! The main window. Tabs mirror Napster 2.0: Chat, Library (My Files),
-//! Search, Hot List, Transfer and Discover, plus a Home console.
+//! The main window, laid out like Napster v2.0 BETA 7-10: a row of tab
+//! buttons (Home, Chat, Library, Search, Hot List, Transfer, Discover,
+//! Help) over a gray Win2000-style body, with a two-panel status bar.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, vec2, Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
-use napster_core::{
-    ChannelUser, Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState,
-};
+use napster_core::{ChannelUser, Client, ClientConfig, Command, ConnState, Direction, Event, TransferInfo, TransferState};
 use napster_proto::{link_speed_name, Compare, FileInfo, SearchQuery, SearchResult, LINK_SPEEDS};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-const ACCENT: Color32 = Color32::from_rgb(0x5a, 0xb4, 0xff);
-const SYSTEM: Color32 = Color32::from_rgb(0xe6, 0xc0, 0x4a);
-const ERROR: Color32 = Color32::from_rgb(0xff, 0x6a, 0x6a);
-const EMOTE: Color32 = Color32::from_rgb(0xc8, 0x8c, 0xff);
+use crate::classic::{self, bold, commas};
+use crate::snapshot::{self, Phase, Shot, Snapshots};
+
+// console / chat colors, as in the original's default (white) scheme
+const C_SYSTEM: Color32 = Color32::from_rgb(0x00, 0x00, 0xa0);
+const C_ERROR: Color32 = Color32::from_rgb(0xc0, 0x00, 0x00);
+const C_EMOTE: Color32 = Color32::from_rgb(0x80, 0x00, 0x80);
+const C_JOIN: Color32 = Color32::from_rgb(0x00, 0x80, 0x00);
+const C_NICK: Color32 = Color32::from_rgb(0x00, 0x00, 0x80);
+const C_ME: Color32 = Color32::from_rgb(0x80, 0x00, 0x00);
 const MAX_LINES: usize = 2000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,24 +34,28 @@ enum Tab {
     HotList,
     Transfer,
     Discover,
+    Help,
 }
 
 #[derive(Clone)]
 struct Line {
-    color: Option<Color32>,
-    who: Option<String>,
+    color: Color32,
+    who: Option<(String, Color32)>,
     text: String,
 }
 
 impl Line {
     fn sys(text: impl Into<String>) -> Self {
-        Line { color: Some(SYSTEM), who: None, text: text.into() }
+        Line { color: C_SYSTEM, who: None, text: text.into() }
     }
     fn err(text: impl Into<String>) -> Self {
-        Line { color: Some(ERROR), who: None, text: text.into() }
+        Line { color: C_ERROR, who: None, text: text.into() }
     }
-    fn said(who: &str, text: impl Into<String>) -> Self {
-        Line { color: None, who: Some(who.to_owned()), text: text.into() }
+    fn join(text: impl Into<String>) -> Self {
+        Line { color: C_JOIN, who: None, text: text.into() }
+    }
+    fn said(who: &str, me: bool, text: impl Into<String>) -> Self {
+        Line { color: classic::TEXT, who: Some((who.to_owned(), if me { C_ME } else { C_NICK })), text: text.into() }
     }
 }
 
@@ -87,14 +97,16 @@ enum SortCol {
     Speed,
 }
 
+const SORT_COLS: [SortCol; 7] =
+    [SortCol::File, SortCol::Size, SortCol::Bitrate, SortCol::Freq, SortCol::Length, SortCol::User, SortCol::Speed];
+
 struct SearchView {
     artist: String,
     title: String,
     max_results: u32,
-    advanced: bool,
-    bitrate: Option<(Compare, u32)>,
-    speed: Option<(Compare, u32)>,
-    freq: Option<(Compare, u32)>,
+    bitrate: (Option<Compare>, u32),
+    freq: (Option<Compare>, u32),
+    speed: (Option<Compare>, u32),
     results: Vec<SearchResult>,
     searching: bool,
     selected: HashSet<usize>,
@@ -106,6 +118,13 @@ struct BrowseView {
     results: Vec<SearchResult>,
     done: bool,
     selected: HashSet<usize>,
+}
+
+/// What a right-click menu or button asked for, applied after drawing.
+#[derive(Clone)]
+enum Act {
+    Get(SearchResult),
+    User(String, &'static str),
 }
 
 pub struct App {
@@ -120,27 +139,33 @@ pub struct App {
     console: Vec<Line>,
     console_input: String,
     library: Vec<FileInfo>,
-    library_filter: String,
+    library_selected: Option<usize>,
     scanning: Option<(usize, usize)>,
     search: SearchView,
     browse: Option<BrowseView>,
     transfers: BTreeMap<u64, TransferInfo>,
+    selected_transfer: Option<u64>,
+    /// link speeds seen in search results, for the Transfer "Speed" column
+    speeds: HashMap<String, u32>,
     chats: BTreeMap<ChatKey, ChatView>,
     active_chat: Option<ChatKey>,
     channel_list: Vec<(String, u32, String)>,
-    channel_filter: String,
+    channel_selected: Option<usize>,
     new_channel: String,
     /// lower nick -> (display nick, link speed if online)
     hotlist: BTreeMap<String, (String, Option<u32>)>,
     hotlist_input: String,
+    hotlist_selected: Option<String>,
     whois: Option<Vec<(String, String)>>,
     prefs: Option<ClientConfig>,
-    new_shared_dir: String,
+    force_splash: bool,
+    snap: Option<Snapshots>,
+    snap_whois: Option<Vec<(String, String)>>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        classic::install(&cc.egui_ctx);
         let config = ClientConfig::load(&config_path).unwrap_or_default();
         let ctx = cc.egui_ctx.clone();
         let (client, events) = napster_core::Client::start(config.clone(), Some(Arc::new(move || ctx.request_repaint())));
@@ -155,22 +180,18 @@ impl App {
             status: "Offline".into(),
             stats: (0, 0, 0),
             tab: Tab::Home,
-            console: vec![
-                Line::sys(format!("{} - a Rust rewrite of Napster v2.0 BETA 10", napster_core::CLIENT_INFO)),
-                Line::sys("Use File > Connect (or the Connect button) to connect to a Napster Server!"),
-            ],
+            console: vec![Line::sys(format!("{} — Napster v2.0 BETA 10, rebuilt in Rust.", napster_core::CLIENT_INFO))],
             console_input: String::new(),
             library: vec![],
-            library_filter: String::new(),
+            library_selected: None,
             scanning: None,
             search: SearchView {
                 artist: String::new(),
                 title: String::new(),
                 max_results: 100,
-                advanced: false,
-                bitrate: None,
-                speed: None,
-                freq: None,
+                bitrate: (None, 128),
+                freq: (None, 44100),
+                speed: (None, 7),
                 results: vec![],
                 searching: false,
                 selected: HashSet::new(),
@@ -178,22 +199,29 @@ impl App {
             },
             browse: None,
             transfers: BTreeMap::new(),
+            selected_transfer: None,
+            speeds: HashMap::new(),
             chats: BTreeMap::new(),
             active_chat: None,
             channel_list: vec![],
-            channel_filter: String::new(),
+            channel_selected: None,
             new_channel: String::new(),
             hotlist,
             hotlist_input: String::new(),
+            hotlist_selected: None,
             whois: None,
             prefs: None,
-            new_shared_dir: String::new(),
+            force_splash: false,
+            snap: Snapshots::from_env(),
+            snap_whois: None,
         };
         if first_run {
-            app.console.push(Line::sys("Welcome! Pick a user name and password in Preferences to get started."));
+            app.console.push(Line::sys("Welcome! Choose a user name and password in File > Preferences."));
             app.prefs = Some(config);
         } else if config.auto_connect && !config.password.is_empty() {
             app.client.send(Command::Connect);
+        } else {
+            app.console.push(Line::sys("Use File->Connect to connect to a Napster Server!"));
         }
         app
     }
@@ -218,7 +246,7 @@ impl App {
 
     fn save_config(&mut self) {
         if let Err(e) = self.config.save(&self.config_path) {
-            self.log(Line::err(format!("WARNING: could not save settings: {e}")));
+            self.log(Line::err(format!("WARNING: Registry write attempt failed! ({e})")));
         }
     }
 
@@ -238,8 +266,8 @@ impl App {
         match e {
             Event::State(s) => {
                 match &s {
-                    ConnState::Online { nick } => {
-                        self.log(Line::sys(format!("Connected to Server as {nick}!")));
+                    ConnState::Online { .. } => {
+                        self.log(Line::sys("Connected to Server!"));
                         self.client.send(Command::ListChannels);
                     }
                     ConnState::Disconnected => {
@@ -250,11 +278,9 @@ impl App {
                         if matches!(self.active_chat, Some(ChatKey::Channel(_))) {
                             self.active_chat = None;
                         }
+                        self.status = "Offline".into();
                     }
                     ConnState::Connecting => {}
-                }
-                if s == ConnState::Disconnected {
-                    self.status = "Offline".into();
                 }
                 self.conn = s;
             }
@@ -264,33 +290,29 @@ impl App {
             }
             Event::Info(s) => self.log(Line::sys(s)),
             Event::Error(s) => {
-                // route channel errors to the active chat too
-                if let Some(key) = &self.active_chat {
-                    if self.tab == Tab::Chat {
-                        if let Some(c) = self.chats.get_mut(key) {
-                            c.push(Line::err(s.clone()));
-                        }
+                if self.tab == Tab::Chat {
+                    if let Some(c) = self.active_chat.clone().and_then(|k| self.chats.get_mut(&k)) {
+                        c.push(Line::err(s.clone()));
                     }
                 }
-                if self.browse.as_ref().is_some_and(|b| !b.done) && s.contains("not online") {
+                if s.contains("not online") {
                     if let Some(b) = &mut self.browse {
                         b.done = true;
                     }
                 }
                 self.log(Line::err(s));
             }
-            Event::Motd(s) => self.log(Line { color: Some(ACCENT), who: None, text: s }),
+            Event::Motd(s) => self.log(Line { color: classic::TEXT, who: None, text: s }),
             Event::Stats { users, files, gigabytes } => self.stats = (users, files, gigabytes),
-            Event::LibraryScanning { done, total } => {
-                self.scanning = (done < total).then_some((done, total));
-            }
+            Event::LibraryScanning { done, total } => self.scanning = (done < total).then_some((done, total)),
             Event::Library(files) => {
                 self.scanning = None;
-                self.log(Line::sys(format!("Library: {} shareable files.", files.len())));
                 self.library = files;
+                self.library_selected = None;
             }
             Event::SearchResult(r) => {
                 if self.search.searching {
+                    self.speeds.insert(r.nick.to_lowercase(), r.link_speed);
                     self.search.results.push(r);
                 }
             }
@@ -317,7 +339,10 @@ impl App {
             }
             Event::Transfer(t) => {
                 if t.state == TransferState::Complete && t.direction == Direction::Download {
-                    self.log(Line::sys(format!("Download complete: {}", t.basename())));
+                    let was = self.transfers.get(&t.id).map(|o| o.state.clone());
+                    if was != Some(TransferState::Complete) {
+                        self.log(Line::sys(format!("Download complete: {}", t.basename())));
+                    }
                 }
                 self.transfers.insert(t.id, t);
             }
@@ -328,7 +353,7 @@ impl App {
                 let key = ChatKey::Private(from.to_lowercase());
                 let active = self.active_chat.as_ref() == Some(&key) && self.tab == Tab::Chat;
                 let view = self.chat(key.clone(), &from);
-                view.push(Line::said(&from, text));
+                view.push(Line::said(&from, false, text));
                 view.unread |= !active;
                 if self.active_chat.is_none() {
                     self.active_chat = Some(key);
@@ -336,7 +361,7 @@ impl App {
             }
             Event::Joined { channel } => {
                 let key = ChatKey::Channel(channel.to_lowercase());
-                self.chat(key.clone(), &channel).push(Line::sys(format!("Joined {channel}.")));
+                self.chat(key.clone(), &channel);
                 self.active_chat = Some(key);
                 self.tab = Tab::Chat;
             }
@@ -354,7 +379,7 @@ impl App {
             }
             Event::UserJoined { channel, user } => {
                 let v = self.chat(ChatKey::Channel(channel.to_lowercase()), &channel);
-                v.push(Line::sys(format!(
+                v.push(Line::join(format!(
                     "* {} ({}) [sharing {} file{}] has joined.",
                     user.nick,
                     link_speed_name(user.link_speed),
@@ -366,26 +391,38 @@ impl App {
             }
             Event::UserParted { channel, nick } => {
                 let v = self.chat(ChatKey::Channel(channel.to_lowercase()), &channel);
-                v.push(Line::sys(format!("* {nick} has left.")));
+                if let Some(u) = v.users.iter().find(|u| u.nick.eq_ignore_ascii_case(&nick)) {
+                    let line = format!(
+                        "* {} ({}) [sharing {} file{}] has left.",
+                        u.nick,
+                        link_speed_name(u.link_speed),
+                        u.shared,
+                        if u.shared == 1 { "" } else { "s" }
+                    );
+                    v.push(Line::join(line));
+                }
                 v.users.retain(|u| !u.nick.eq_ignore_ascii_case(&nick));
             }
             Event::ChannelMessage { channel, nick, text } => {
                 let key = ChatKey::Channel(channel.to_lowercase());
                 let active = self.active_chat.as_ref() == Some(&key) && self.tab == Tab::Chat;
+                let me = nick.eq_ignore_ascii_case(self.my_nick());
                 let v = self.chat(key, &channel);
-                v.push(Line::said(&nick, text));
+                v.push(Line::said(&nick, me, text));
                 v.unread |= !active;
             }
             Event::ChannelEmote { channel, nick, text } => {
                 let v = self.chat(ChatKey::Channel(channel.to_lowercase()), &channel);
-                v.push(Line { color: Some(EMOTE), who: None, text: format!("* {nick} {text}") });
+                v.push(Line { color: C_EMOTE, who: None, text: format!("* {nick} {text}") });
             }
             Event::Topic { channel, topic } => {
                 let v = self.chat(ChatKey::Channel(channel.to_lowercase()), &channel);
-                v.push(Line::sys(format!("Topic: {topic}")));
                 v.topic = topic;
             }
-            Event::ChannelList(list) => self.channel_list = list,
+            Event::ChannelList(list) => {
+                self.channel_list = list;
+                self.channel_selected = None;
+            }
             Event::HotlistOnline { nick, link_speed } => {
                 self.hotlist.entry(nick.to_lowercase()).or_insert_with(|| (nick.clone(), None)).1 = Some(link_speed);
             }
@@ -395,13 +432,13 @@ impl App {
                 }
             }
             Event::Whois(fields) => self.whois = Some(fields),
-            Event::Pong { nick } => self.log(Line::sys(format!("Pong from {nick}!"))),
-            Event::ServerPong { millis } => self.log(Line::sys(format!("Received pong from Server: {millis} ms"))),
-            Event::Announcement { from, text } => {
-                self.log(Line { color: Some(ACCENT), who: None, text: format!("* [Announcement] {from}: {text}") })
+            Event::Pong { nick } => self.log(Line::sys(format!("[{}] Pong from {nick}!", clock()))),
+            Event::ServerPong { millis } => {
+                self.log(Line::sys(format!("[{}] Received pong from Server: {millis} ms", clock())))
             }
+            Event::Announcement { from, text } => self.log(Line::err(format!("* [Announcement] {from}: {text}"))),
             Event::ChannelInvite { from, channel } => {
-                self.log(Line::sys(format!("User {from} has invited you to the chat room {channel}! (/join {channel})")))
+                self.log(Line::sys(format!("User {from} has invited you to a chat room! (/join {channel})")))
             }
         }
     }
@@ -409,6 +446,10 @@ impl App {
     // ------------------------------------------------------------- actions
 
     fn connect(&mut self) {
+        if self.online() {
+            self.log(Line::err("You are already connected to the Napster Server!"));
+            return;
+        }
         if self.config.nick.is_empty() || self.config.password.is_empty() {
             self.prefs = Some(self.config.clone());
             self.log(Line::err("Set a user name and password first."));
@@ -418,18 +459,26 @@ impl App {
     }
 
     fn start_search(&mut self) {
-        let terms: Vec<String> =
-            [&self.search.artist, &self.search.title].iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+        let terms: Vec<String> = [&self.search.artist, &self.search.title]
+            .iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
         if terms.is_empty() {
             self.log(Line::err("Must specify a song title or artist to search!"));
             return;
         }
+        if !self.online() {
+            self.log(Line::err("Not connected to Server!"));
+            return;
+        }
+        let pick = |(c, v): (Option<Compare>, u32)| c.map(|c| (c, v));
         let q = SearchQuery {
             terms,
             max_results: self.search.max_results,
-            link_speed: self.search.speed.filter(|_| self.search.advanced),
-            bitrate: self.search.bitrate.filter(|_| self.search.advanced),
-            frequency: self.search.freq.filter(|_| self.search.advanced),
+            link_speed: pick(self.search.speed),
+            bitrate: pick(self.search.bitrate),
+            frequency: pick(self.search.freq),
             ..Default::default()
         };
         self.search.results.clear();
@@ -467,7 +516,7 @@ impl App {
         self.browse = Some(BrowseView { nick: nick.to_owned(), results: vec![], done: false, selected: HashSet::new() });
         self.client.send(Command::Browse(nick.to_owned()));
         self.tab = Tab::HotList;
-        self.log(Line::sys(format!("Populating list for User: {nick} ...")));
+        self.hotlist_selected = Some(nick.to_lowercase());
     }
 
     fn hotlist_add(&mut self, nick: &str) {
@@ -497,6 +546,35 @@ impl App {
         self.tab = Tab::Chat;
     }
 
+    fn apply(&mut self, act: Act) {
+        match act {
+            Act::Get(r) => self.download(&r),
+            Act::User(nick, what) => self.user_action(&nick, what),
+        }
+    }
+
+    fn user_action(&mut self, nick: &str, what: &str) {
+        match what {
+            "msg" => self.open_private(nick),
+            "browse" => self.browse(nick),
+            "whois" => self.client.send(Command::Whois(nick.to_owned())),
+            "hotlist" => self.hotlist_add(nick),
+            "remove" => self.hotlist_remove(nick),
+            "select" => self.hotlist_selected = Some(nick.to_lowercase()),
+            "ping" => {
+                self.log(Line::sys(format!("[{}] Ping to {nick}...", clock())));
+                self.client.send(Command::Ping(nick.to_owned()));
+            }
+            "ignore" => self.client.send(Command::Ignore(nick.to_owned())),
+            "part" => self.client.send(Command::Part(nick.to_owned())),
+            "close" => {
+                self.chats.remove(&ChatKey::Private(nick.to_lowercase()));
+                self.active_chat = None;
+            }
+            _ => {}
+        }
+    }
+
     /// IRC-style input from a chat or the console.
     fn submit(&mut self, target: Option<ChatKey>, text: String) {
         let text = text.trim_end().to_owned();
@@ -516,7 +594,7 @@ impl App {
             let rest = rest.trim();
             let arg1 = rest.split_whitespace().next().unwrap_or("").to_owned();
             let channel = match &target {
-                Some(ChatKey::Channel(c)) => self.chats.get(&ChatKey::Channel(c.clone())).map(|v| v.title.clone()),
+                Some(k @ ChatKey::Channel(_)) => self.chats.get(k).map(|v| v.title.clone()),
                 _ => None,
             };
             match verb.to_lowercase().as_str() {
@@ -543,14 +621,14 @@ impl App {
                 },
                 "topic" => match channel {
                     Some(c) => self.client.send(Command::SetTopic { channel: c, topic: rest.to_owned() }),
-                    None => push_here(self, Line::err("Proper syntax: /topic <Topic> (from a channel window)")),
+                    None => push_here(self, Line::err("Proper syntax: /topic <Channel> <Topic>")),
                 },
                 "whois" | "finger" if !arg1.is_empty() => self.client.send(Command::Whois(arg1)),
-                "ping" if !arg1.is_empty() => {
-                    push_here(self, Line::sys(format!("Ping to {arg1}...")));
-                    self.client.send(Command::Ping(arg1));
+                "ping" if !arg1.is_empty() => self.user_action(&arg1, "ping"),
+                "serverping" => {
+                    push_here(self, Line::sys(format!("[{}] Ping sent to Server...", clock())));
+                    self.client.send(Command::PingServer);
                 }
-                "serverping" => self.client.send(Command::PingServer),
                 "browse" if !arg1.is_empty() => self.browse(&arg1),
                 "ignore" if !arg1.is_empty() => self.client.send(Command::Ignore(arg1)),
                 "unignore" if !arg1.is_empty() => self.client.send(Command::Unignore(arg1)),
@@ -570,178 +648,244 @@ impl App {
                         None => push_here(self, Line::err("Proper syntax: /raw <numeric> <data>")),
                     }
                 }
-                "help" => {
-                    for l in [
-                        "/join <channel>  /part [channel]  /msg <user> <text>  /me <action>",
-                        "/topic <text>  /whois <user>  /ping <user>  /serverping  /browse <user>",
-                        "/ignore <user>  /unignore <user>  /hotlist <user>  /clear  /raw <num> <data>",
-                    ] {
-                        push_here(self, Line::sys(l));
-                    }
-                }
-                _ => push_here(self, Line::err(format!("Unknown Command '{verb}'! (try /help)"))),
+                "help" => self.tab = Tab::Help,
+                _ => push_here(self, Line::err(format!("Unknown Command '{verb}'!"))),
             }
             return;
         }
         match target {
-            Some(ChatKey::Channel(c)) => {
-                let name = self.chats.get(&ChatKey::Channel(c)).map(|v| v.title.clone()).unwrap_or_default();
+            Some(k @ ChatKey::Channel(_)) => {
+                let name = self.chats.get(&k).map(|v| v.title.clone()).unwrap_or_default();
                 self.client.send(Command::Say { channel: name, text });
             }
-            Some(ChatKey::Private(n)) => {
-                let nick = self.chats.get(&ChatKey::Private(n)).map(|v| v.title.clone()).unwrap_or_default();
+            Some(k @ ChatKey::Private(_)) => {
+                let nick = self.chats.get(&k).map(|v| v.title.clone()).unwrap_or_default();
                 self.send_private(&nick, text);
             }
-            None => self.log(Line::err("Type /help for commands, or open the Chat tab to talk.")),
+            None => self.log(Line::err("Use the 'Chat' button to join a channel, or type /help.")),
         }
     }
 
     fn send_private(&mut self, nick: &str, text: String) {
         let me = self.my_nick().to_owned();
-        self.chat(ChatKey::Private(nick.to_lowercase()), nick).push(Line::said(&me, text.clone()));
+        self.chat(ChatKey::Private(nick.to_lowercase()), nick).push(Line::said(&me, true, text.clone()));
         self.client.send(Command::PrivateMessage { to: nick.to_owned(), text });
     }
 
-    // ------------------------------------------------------------------ ui
+    // ------------------------------------------------------------ chrome
 
     fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.add_enabled(!self.online(), egui::Button::new("Connect")).clicked() {
-                        self.connect();
-                        ui.close_menu();
-                    }
-                    if ui.add_enabled(self.online(), egui::Button::new("Disconnect")).clicked() {
-                        self.client.send(Command::Disconnect);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Preferences...").clicked() {
-                        self.prefs = Some(self.config.clone());
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("Actions", |ui| {
-                    if ui.button("Join Chat Rooms").clicked() {
-                        self.tab = Tab::Discover;
-                        self.client.send(Command::ListChannels);
-                        ui.close_menu();
-                    }
-                    if ui.button("Rescan My Files").clicked() {
-                        self.client.send(Command::Rescan);
-                        ui.close_menu();
-                    }
-                    if ui.button("Ping Server").clicked() {
-                        self.client.send(Command::PingServer);
-                        ui.close_menu();
-                    }
-                    if ui.button("Clear Finished Transfers").clicked() {
-                        self.client.send(Command::ClearFinished);
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    ui.label(format!("{} — Rust rewrite of Napster v2.0 BETA 10", napster_core::CLIENT_INFO));
-                    ui.label("Type /help in any chat box for commands.");
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match &self.conn {
-                        ConnState::Online { .. } => {
-                            if ui.button("Disconnect").clicked() {
-                                self.client.send(Command::Disconnect);
-                            }
-                            ui.label(RichText::new("● Online").color(Color32::LIGHT_GREEN));
+        egui::TopBottomPanel::top("menu")
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin::symmetric(2, 1)))
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.add_enabled(!self.online(), egui::Button::new("Connect")).clicked() {
+                            self.connect();
+                            ui.close_menu();
                         }
-                        ConnState::Connecting => {
-                            ui.spinner();
-                            ui.label("Connecting...");
+                        if ui.add_enabled(self.online(), egui::Button::new("Disconnect")).clicked() {
+                            self.client.send(Command::Disconnect);
+                            ui.close_menu();
                         }
-                        ConnState::Disconnected => {
-                            if ui.button("Connect").clicked() {
-                                self.connect();
-                            }
-                            ui.label(RichText::new("● Offline").color(Color32::GRAY));
+                        ui.separator();
+                        if ui.button("Preferences...").clicked() {
+                            self.prefs = Some(self.config.clone());
+                            ui.close_menu();
                         }
-                    }
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                    ui.menu_button("Actions", |ui| {
+                        if ui.button("Join Chat Rooms").clicked() {
+                            self.tab = Tab::Discover;
+                            self.client.send(Command::ListChannels);
+                            ui.close_menu();
+                        }
+                        if ui.button("View Ignore List").clicked() {
+                            self.tab = Tab::Home;
+                            self.client.send(Command::Raw(napster_proto::msg::IGNORE_LIST, String::new()));
+                            ui.close_menu();
+                        }
+                        if ui.button("Add User to Hot List").clicked() {
+                            self.tab = Tab::HotList;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Rescan My Files").clicked() {
+                            self.client.send(Command::Rescan);
+                            ui.close_menu();
+                        }
+                        if ui.button("Ping Server").clicked() {
+                            self.submit(None, "/serverping".into());
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("Help Topics").clicked() || ui.button("About Napster").clicked() {
+                            self.tab = Tab::Help;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn tab_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("napster").color(ACCENT).strong());
-                ui.add_space(12.0);
-                let unread = self.chats.values().any(|c| c.unread);
-                let downloads = self.transfers.values().filter(|t| !t.state.is_finished()).count();
-                let tabs = [
-                    (Tab::Home, "Home".to_owned()),
-                    (Tab::Chat, if unread { "Chat •".into() } else { "Chat".into() }),
-                    (Tab::Library, "Library".into()),
-                    (Tab::Search, "Search".into()),
-                    (Tab::HotList, "Hot List".into()),
-                    (Tab::Transfer, if downloads > 0 { format!("Transfer ({downloads})") } else { "Transfer".into() }),
-                    (Tab::Discover, "Discover".into()),
-                ];
-                for (tab, label) in tabs {
-                    if ui.selectable_label(self.tab == tab, RichText::new(label).size(15.0)).clicked() {
-                        self.tab = tab;
-                        if tab == Tab::Discover && self.online() {
-                            self.client.send(Command::ListChannels);
+        egui::TopBottomPanel::top("tabs")
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 4 }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let unread = self.chats.values().any(|c| c.unread);
+                    use classic::Icon;
+                    let tabs = [
+                        (Tab::Home, Icon::Home, "Home"),
+                        (Tab::Chat, Icon::Chat, if unread { "Chat *" } else { "Chat" }),
+                        (Tab::Library, Icon::Library, "Library"),
+                        (Tab::Search, Icon::Search, "Search"),
+                        (Tab::HotList, Icon::HotList, "Hot List"),
+                        (Tab::Transfer, Icon::Transfer, "Transfer"),
+                        (Tab::Discover, Icon::Discover, "Discover"),
+                        (Tab::Help, Icon::Help, "Help"),
+                    ];
+                    for (tab, icon, label) in tabs {
+                        if classic::tab_button(ui, icon, label, self.tab == tab).clicked() {
+                            self.tab = tab;
+                            if tab == Tab::Discover && self.online() {
+                                self.client.send(Command::ListChannels);
+                            }
                         }
-                    }
-                }
-            });
-            ui.add_space(4.0);
-        });
-    }
-
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                if let Some((d, t)) = self.scanning {
-                    ui.separator();
-                    ui.spinner();
-                    ui.label(format!("Scanning {d} of {t}"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.online() {
-                        let (u, f, g) = self.stats;
-                        ui.label(format!("Currently {u} users sharing {f} files ({g} gigs)"));
                     }
                 });
             });
-        });
     }
 
-    fn home(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Console");
-        ui.separator();
-        let input_h = 32.0;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(true)
-            .max_height(ui.available_height() - input_h)
-            .show(ui, |ui| {
-                for l in &self.console {
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin::same(2)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let left = match (&self.conn, self.scanning) {
+                        (_, Some((d, t))) => format!("Building My Files... ({d} of {t})"),
+                        (ConnState::Online { nick }, _) => {
+                            format!("Online ({nick}): Sharing {} files.", commas(self.library.len() as u64))
+                        }
+                        (ConnState::Connecting, _) => self.status.clone(),
+                        (ConnState::Disconnected, _) => "Offline".into(),
+                    };
+                    let w = ui.available_width();
+                    classic::status_panel(ui, &left, (w * 0.42).max(200.0));
+                    let right = if self.online() {
+                        let (users, files, gigs) = self.stats;
+                        format!(
+                            "Currently {} files ({} gigabytes) available in {} libraries.",
+                            commas(files),
+                            commas(gigs),
+                            commas(users)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    classic::status_panel(ui, &right, ui.available_width());
+                });
+            });
+    }
+
+    /// The "Logging on to Server..." window shown while connecting.
+    fn splash(&mut self, ctx: &egui::Context) {
+        if !(matches!(self.conn, ConnState::Connecting) || self.force_splash) {
+            return;
+        }
+        let mut open = true;
+        let status = self.status.clone();
+        let text = if !self.force_splash
+            && (status.starts_with("Connecting") || status.starts_with("Resolving") || status.starts_with("Finding"))
+        {
+            status
+        } else {
+            "Logging on to Server...".to_owned()
+        };
+        let mut cancel = false;
+        classic::dialog(ctx, "splash", "Napster Status", &mut open, 380.0, |ui| {
+            classic::sunken(ui, vec2(368.0, 92.0), Color32::WHITE, |ui| {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(52.0);
+                    classic::wordmark(ui, 58.0, false);
+                });
+            });
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(text).size(15.0));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                // marching blocks, like the original's progress bar
+                let (rect, _) = ui.allocate_exact_size(vec2(270.0, 20.0), egui::Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(rect, egui::CornerRadius::ZERO, Color32::WHITE);
+                classic::bevel(p, rect, false);
+                let blocks = ((ui.input(|i| i.time) * 4.0) as usize) % 22;
+                for b in 0..blocks.max(1) {
+                    let x = rect.left() + 3.0 + b as f32 * 12.0;
+                    if x + 10.0 < rect.right() - 2.0 {
+                        p.rect_filled(
+                            egui::Rect::from_min_size(egui::pos2(x, rect.top() + 3.0), vec2(10.0, rect.height() - 6.0)),
+                            egui::CornerRadius::ZERO,
+                            classic::NAVY,
+                        );
+                    }
+                }
+                cancel = classic::button(ui, "Cancel", Some(84.0)).clicked();
+            });
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if cancel || !open {
+            if !self.force_splash {
+                self.client.send(Command::Disconnect);
+            }
+            self.force_splash = false;
+        }
+    }
+
+    // ---------------------------------------------------------------- tabs
+
+    fn home(&mut self, ui: &mut Ui) {
+        let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 74.0), egui::Sense::hover());
+        ui.painter().rect_filled(banner, egui::CornerRadius::ZERO, Color32::BLACK);
+        classic::bevel(ui.painter(), banner, false);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(banner.shrink(10.0)));
+        child.horizontal(|ui| {
+            classic::wordmark(ui, 54.0, true);
+            ui.add_space(20.0);
+            ui.vertical(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Napster v2.0 BETA 10").color(Color32::from_rgb(0xc0, 0xc0, 0xc0)).size(14.0));
+                ui.label(RichText::new(napster_core::CLIENT_INFO).color(Color32::from_rgb(0x80, 0x80, 0x80)));
+            });
+        });
+        ui.add_space(6.0);
+        let h = ui.available_height() - 30.0;
+        let w = ui.available_width();
+        let lines = &self.console;
+        classic::sunken(ui, vec2(w, h), Color32::WHITE, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
+                ui.add_space(2.0);
+                for l in lines {
                     line_ui(ui, l);
                 }
             });
+        });
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.console_input)
-                    .hint_text("/help for commands")
-                    .desired_width(f32::INFINITY),
-            );
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let w = ui.available_width() - 70.0;
+            let r = classic::text_field_ex(ui, &mut self.console_input, w, false, "/help for commands");
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if classic::button(ui, "Send", Some(64.0)).clicked() || enter {
                 let text = std::mem::take(&mut self.console_input);
                 self.submit(None, text);
                 r.request_focus();
@@ -749,705 +893,759 @@ impl App {
         });
     }
 
-    fn chat_tab(&mut self, ui: &mut egui::Ui) {
-        if self.chats.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label("You are not in any chat rooms.");
-                if ui.button("Join Chat Rooms").clicked() {
-                    self.tab = Tab::Discover;
-                    self.client.send(Command::ListChannels);
-                }
-            });
-            return;
-        }
+    fn chat_tab(&mut self, ui: &mut Ui) {
         if self.active_chat.as_ref().is_none_or(|k| !self.chats.contains_key(k)) {
             self.active_chat = self.chats.keys().next().cloned();
         }
-        // room tabs
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             let keys: Vec<ChatKey> = self.chats.keys().cloned().collect();
             for k in keys {
                 let v = &self.chats[&k];
                 let mut label = match &k {
                     ChatKey::Channel(_) => v.title.clone(),
-                    ChatKey::Private(_) => format!("✉ {}", v.title),
+                    ChatKey::Private(_) => format!("{} (IM)", v.title),
                 };
                 if v.unread {
-                    label.push_str(" •");
+                    label.push_str(" *");
                 }
                 let selected = self.active_chat.as_ref() == Some(&k);
-                if ui.selectable_label(selected, label).clicked() {
+                if classic::button_ex(ui, label, None, true, selected).clicked() {
                     self.active_chat = Some(k.clone());
                 }
             }
+            ui.add_space(8.0);
+            if classic::button(ui, "Join Chat Rooms...", None).clicked() {
+                self.tab = Tab::Discover;
+                self.client.send(Command::ListChannels);
+            }
         });
-        ui.separator();
-        let Some(key) = self.active_chat.clone() else { return };
+        ui.add_space(4.0);
+        let Some(key) = self.active_chat.clone() else {
+            let (w, h) = (ui.available_width(), ui.available_height());
+            classic::sunken(ui, vec2(w, h), Color32::WHITE, |ui| {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| {
+                    ui.label("Use the 'Join Chat Rooms...' button to join a channel!");
+                });
+            });
+            return;
+        };
         if let Some(v) = self.chats.get_mut(&key) {
             v.unread = false;
         }
         let is_channel = matches!(key, ChatKey::Channel(_));
-        let mut action: Option<(String, &'static str)> = None;
-        if is_channel {
-            egui::SidePanel::right("chat_users").resizable(true).default_width(180.0).show_inside(ui, |ui| {
-                let v = &self.chats[&key];
-                ui.strong(format!("{} users", v.users.len()));
-                ui.separator();
-                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                    for u in &v.users {
-                        let r = ui.selectable_label(false, &u.nick).on_hover_text(format!(
-                            "{} — sharing {} files",
-                            link_speed_name(u.link_speed),
-                            u.shared
-                        ));
-                        r.context_menu(|ui| {
-                            for (label, what) in [
-                                ("Instant Message", "msg"),
-                                ("Browse Files", "browse"),
-                                ("View User Information", "whois"),
-                                ("Add to Hot List", "hotlist"),
-                                ("Ping", "ping"),
-                                ("Ignore", "ignore"),
-                            ] {
-                                if ui.button(label).clicked() {
-                                    action = Some((u.nick.clone(), what));
-                                    ui.close_menu();
-                                }
+        let action: RefCell<Option<Act>> = RefCell::new(None);
+        let total_w = ui.available_width();
+        let users_w = if is_channel { 190.0 } else { 0.0 };
+        let text_w = if is_channel { total_w - users_w - 6.0 } else { total_w };
+        let text_h = ui.available_height() - 52.0;
+        let v = &self.chats[&key];
+        let topic = if v.topic.is_empty() { v.title.clone() } else { format!("{}:  {}", v.title, v.topic) };
+        let title = v.title.clone();
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(text_w);
+                classic::status_panel(ui, &topic, text_w);
+                ui.add_space(2.0);
+                classic::sunken(ui, vec2(text_w, text_h), Color32::WHITE, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("chat", title.clone()))
+                        .auto_shrink([false; 2])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for l in &v.lines {
+                                line_ui(ui, l);
                             }
                         });
-                        if r.double_clicked() {
-                            action = Some((u.nick.clone(), "msg"));
-                        }
-                    }
                 });
             });
-        }
-        let v = self.chats.get_mut(&key).unwrap();
-        ui.horizontal(|ui| {
-            ui.strong(&v.title);
-            if !v.topic.is_empty() {
-                ui.label(RichText::new(&v.topic).italics());
+            if is_channel {
+                ui.vertical(|ui| {
+                    classic::status_panel(ui, &format!("{} users", v.users.len()), users_w);
+                    ui.add_space(2.0);
+                    classic::sunken(ui, vec2(users_w, text_h), Color32::WHITE, |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for u in &v.users {
+                                let r = ui
+                                    .add(egui::Label::new(u.nick.as_str()).sense(egui::Sense::click()).selectable(false))
+                                    .on_hover_text(format!("{} — sharing {} files", link_speed_name(u.link_speed), u.shared));
+                                if r.double_clicked() {
+                                    *action.borrow_mut() = Some(Act::User(u.nick.clone(), "msg"));
+                                }
+                                r.context_menu(|ui| user_menu(ui, &u.nick, &action));
+                            }
+                        });
+                    });
+                });
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if is_channel { "Leave" } else { "Close" };
-                if ui.button(label).clicked() {
-                    action = Some((v.title.clone(), if is_channel { "part" } else { "close" }));
-                }
-            });
         });
-        let input_h = 32.0;
-        egui::ScrollArea::vertical()
-            .id_salt(("chat", v.title.clone()))
-            .auto_shrink([false; 2])
-            .stick_to_bottom(true)
-            .max_height(ui.available_height() - input_h)
-            .show(ui, |ui| {
-                for l in &v.lines {
-                    line_ui(ui, l);
-                }
-            });
+        ui.add_space(4.0);
         let mut submitted = None;
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut v.input).desired_width(f32::INFINITY).hint_text("Say something..."));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let v = self.chats.get_mut(&key).unwrap();
+            let w = ui.available_width() - 150.0;
+            let r = classic::text_field(ui, &mut v.input, w);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if classic::button(ui, "Send", Some(64.0)).clicked() || enter {
                 submitted = Some(std::mem::take(&mut v.input));
                 r.request_focus();
             }
+            let label = if is_channel { "Part" } else { "Close" };
+            if classic::button(ui, label, Some(74.0)).clicked() {
+                *action.borrow_mut() = Some(Act::User(title.clone(), if is_channel { "part" } else { "close" }));
+            }
         });
         if let Some(text) = submitted {
-            self.submit(Some(key.clone()), text);
+            self.submit(Some(key), text);
         }
-        if let Some((nick, what)) = action {
-            self.user_action(&nick, what);
-        }
-    }
-
-    fn user_action(&mut self, nick: &str, what: &str) {
-        match what {
-            "msg" => self.open_private(nick),
-            "browse" => self.browse(nick),
-            "whois" => self.client.send(Command::Whois(nick.to_owned())),
-            "hotlist" => self.hotlist_add(nick),
-            "ping" => self.client.send(Command::Ping(nick.to_owned())),
-            "ignore" => self.client.send(Command::Ignore(nick.to_owned())),
-            "part" => self.client.send(Command::Part(nick.to_owned())),
-            "close" => {
-                self.chats.remove(&ChatKey::Private(nick.to_lowercase()));
-                self.active_chat = None;
-            }
-            _ => {}
+        if let Some(a) = action.into_inner() {
+            self.apply(a);
         }
     }
 
-    fn library_tab(&mut self, ui: &mut egui::Ui) {
+    fn library_tab(&mut self, ui: &mut Ui) {
+        let files = &self.library;
+        let h = ui.available_height() - 58.0;
+        let selected = self.library_selected;
+        let out = list_view(
+            ui,
+            "library",
+            h,
+            &[("Filename", 0.0), ("Filesize", 90.0), ("Bitrate", 55.0), ("Freq", 60.0), ("Length", 55.0)],
+            files.len(),
+            |i| selected == Some(i),
+            |ui, i, c, sel| {
+                let f = &files[i];
+                let t = match c {
+                    0 => f.filename.clone(),
+                    1 => commas(f.size),
+                    2 => dash(f.bitrate),
+                    3 => dash(f.frequency),
+                    _ => duration(f.seconds),
+                };
+                classic::cell(ui, t, sel);
+            },
+            None,
+        );
+        if let Some(i) = out.clicked {
+            self.library_selected = Some(i);
+        }
+        if let Some(i) = out.double {
+            open_path(&PathBuf::from(&self.library[i].filename));
+        }
+        let text = match self.scanning {
+            Some((d, t)) => format!("Building My Files... {d} of {t}"),
+            None if self.library.is_empty() => "No Files Shared.".into(),
+            None => format!("Sharing {} files.", commas(self.library.len() as u64)),
+        };
+        classic::info_bar(ui, &text);
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.heading("My Files");
-            ui.label(format!("{} files shared", self.library.len()));
-            if ui.button("Rescan").clicked() {
+            let w = (ui.available_width() - 12.0) / 3.0;
+            if classic::button(ui, "Rescan My Files", Some(w)).clicked() {
                 self.client.send(Command::Rescan);
             }
-            if ui.button("Shared Folders...").clicked() {
+            if classic::button(ui, "Library Paths...", Some(w)).clicked() {
                 self.prefs = Some(self.config.clone());
             }
-            if ui.button("Open Downloads").clicked() {
+            if classic::button(ui, "Open Save Directory", Some(w)).clicked() {
                 open_path(&self.config.download_dir);
             }
-            ui.add(egui::TextEdit::singleline(&mut self.library_filter).hint_text("filter").desired_width(200.0));
         });
-        if let Some((d, t)) = self.scanning {
-            ui.add(egui::ProgressBar::new(d as f32 / t.max(1) as f32).text(format!("Building My Files... {d}/{t}")));
-        }
-        ui.separator();
-        let filter = self.library_filter.to_lowercase();
-        let files: Vec<&FileInfo> =
-            self.library.iter().filter(|f| filter.is_empty() || f.filename.to_lowercase().contains(&filter)).collect();
-        if files.is_empty() {
-            ui.label("No Files shared. Add folders under Preferences > Shared Folders.");
-            return;
-        }
-        let mut open: Option<PathBuf> = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .column(Column::remainder().at_least(240.0).clip(true))
-            .column(Column::auto().at_least(70.0))
-            .column(Column::auto().at_least(60.0))
-            .column(Column::auto().at_least(60.0))
-            .column(Column::auto().at_least(60.0))
-            .header(20.0, |mut h| {
-                for t in ["Filename", "Size", "Bitrate", "Freq", "Length"] {
-                    h.col(|ui| {
-                        ui.strong(t);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(18.0, files.len(), |mut row| {
-                    let f = files[row.index()];
-                    row.col(|ui| {
-                        ui.label(&f.filename);
-                    });
-                    row.col(|ui| {
-                        ui.label(human_size(f.size));
-                    });
-                    row.col(|ui| {
-                        ui.label(if f.bitrate > 0 { format!("{}", f.bitrate) } else { "-".into() });
-                    });
-                    row.col(|ui| {
-                        ui.label(if f.frequency > 0 { format!("{}", f.frequency) } else { "-".into() });
-                    });
-                    row.col(|ui| {
-                        ui.label(duration(f.seconds));
-                    });
-                    if row.response().double_clicked() {
-                        open = Some(PathBuf::from(&f.filename));
-                    }
-                });
-            });
-        if let Some(p) = open {
-            open_path(&p);
-        }
     }
 
-    fn search_tab(&mut self, ui: &mut egui::Ui) {
+    fn search_tab(&mut self, ui: &mut Ui) {
         let mut go = false;
-        egui::Grid::new("search_form").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Artist:");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search.artist).desired_width(260.0));
-            go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.label("Max Results:");
-            egui::ComboBox::from_id_salt("max_results")
-                .selected_text(self.search.max_results.to_string())
-                .show_ui(ui, |ui| {
-                    for n in [25, 50, 75, 100] {
-                        ui.selectable_value(&mut self.search.max_results, n, n.to_string());
-                    }
-                });
-            ui.end_row();
-            ui.label("Title:");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search.title).desired_width(260.0));
-            go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if self.search.searching {
-                if ui.button("Cancel").clicked() {
-                    self.search.searching = false;
-                }
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Searching...");
-                });
-            } else {
-                go |= ui.button(RichText::new("Find It!").strong()).clicked();
-                ui.label("");
-            }
-            ui.end_row();
-        });
-        ui.checkbox(&mut self.search.advanced, "Advanced");
-        if self.search.advanced {
-            ui.horizontal(|ui| {
-                compare_filter(ui, "Bitrate", "br", &mut self.search.bitrate, &[56, 64, 96, 112, 128, 160, 192, 256, 320], |v| {
-                    format!("{v} Kb/s")
-                });
-                compare_filter(ui, "Line Speed", "ls", &mut self.search.speed, &(0..=10).collect::<Vec<_>>(), |v| {
-                    link_speed_name(v).to_owned()
-                });
-                compare_filter(ui, "Frequency", "fq", &mut self.search.freq, &[16000, 22050, 32000, 44100, 48000], |v| {
-                    format!("{v} Hz")
+        let mut clear = false;
+        ui.horizontal_top(|ui| {
+            let half = (ui.available_width() - 10.0) / 2.0;
+            ui.vertical(|ui| {
+                ui.set_width(half);
+                classic::group(ui, "Search Fields", |ui| {
+                    egui::Grid::new("search_fields").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                        let fw = half - 110.0;
+                        ui.label("Artist:");
+                        let r = classic::text_field(ui, &mut self.search.artist, fw);
+                        go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
+                        ui.label("Song Title:");
+                        let r = classic::text_field(ui, &mut self.search.title, fw);
+                        go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
+                        ui.label("Max Results:");
+                        let mut max = self.search.max_results.to_string();
+                        if classic::text_field(ui, &mut max, fw).changed() {
+                            self.search.max_results = max.trim().parse::<u32>().unwrap_or(100).clamp(1, 100);
+                        }
+                        ui.end_row();
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let bw = (half - 34.0) / 2.0;
+                        clear |= classic::button(ui, "Clear Fields", Some(bw)).clicked();
+                        if self.search.searching {
+                            if classic::button(ui, "Cancel", Some(bw)).clicked() {
+                                self.search.searching = false;
+                            }
+                        } else {
+                            go |= classic::button(ui, "Find It!", Some(bw)).clicked();
+                        }
+                    });
                 });
             });
+            ui.vertical(|ui| {
+                ui.set_width(half);
+                classic::group(ui, "Advanced Fields (OPTIONAL)", |ui| {
+                    egui::Grid::new("adv_fields").num_columns(3).spacing([6.0, 7.0]).show(ui, |ui| {
+                        let cw = (half - 150.0) / 2.0;
+                        let bitrates = [20, 24, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 256, 320];
+                        compare_row(ui, "Bitrate must be:", "br", &mut self.search.bitrate, cw, &bitrates, |v| {
+                            format!("{v} KB/S")
+                        });
+                        let freqs = [8000, 11025, 16000, 22050, 32000, 44100, 48000];
+                        compare_row(ui, "Frequency must be:", "fq", &mut self.search.freq, cw, &freqs, |v| format!("{v} HZ"));
+                        let speeds: Vec<u32> = (0..=10).collect();
+                        compare_row(ui, "Line Speed must be:", "ls", &mut self.search.speed, cw, &speeds, |v| {
+                            link_speed_name(v).to_owned()
+                        });
+                    });
+                });
+            });
+        });
+        if clear {
+            self.search.artist.clear();
+            self.search.title.clear();
+            self.search.bitrate.0 = None;
+            self.search.freq.0 = None;
+            self.search.speed.0 = None;
         }
         if go && !self.search.searching {
             self.start_search();
         }
-        ui.separator();
+        ui.add_space(4.0);
+
+        let h = ui.available_height() - 58.0;
+        let results = &self.search.results;
+        let selected = &self.search.selected;
+        let sort = self.search.sort;
+        let action: RefCell<Option<Act>> = RefCell::new(None);
+        let cols: Vec<(String, f32)> = [
+            ("Filename", 0.0),
+            ("Filesize", 80.0),
+            ("Bitrate", 50.0),
+            ("Freq", 52.0),
+            ("Length", 50.0),
+            ("User", 100.0),
+            ("Line Speed", 80.0),
+            ("Ping", 44.0),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (t, w))| {
+            let arrow = if i < SORT_COLS.len() && SORT_COLS[i] == sort.0 { if sort.1 { " ▲" } else { " ▼" } } else { "" };
+            (format!("{t}{arrow}"), *w)
+        })
+        .collect();
+        let col_refs: Vec<(&str, f32)> = cols.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let mut menu = |ui: &mut Ui, i: usize| {
+            let r = &results[i];
+            if ui.button("Get Song").clicked() {
+                *action.borrow_mut() = Some(Act::Get(r.clone()));
+                ui.close_menu();
+            }
+            user_menu(ui, &r.nick, &action);
+        };
+        let out = list_view(
+            ui,
+            "results",
+            h,
+            &col_refs,
+            results.len(),
+            |i| selected.contains(&i),
+            |ui, i, c, sel| {
+                let r = &results[i];
+                match c {
+                    0 => {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            speed_dot(ui, r.link_speed);
+                            classic::cell(ui, r.file.basename(), sel).on_hover_text(&r.file.filename);
+                        });
+                    }
+                    1 => {
+                        classic::cell(ui, commas(r.file.size), sel);
+                    }
+                    2 => {
+                        classic::cell(ui, dash(r.file.bitrate), sel);
+                    }
+                    3 => {
+                        classic::cell(ui, dash(r.file.frequency), sel);
+                    }
+                    4 => {
+                        classic::cell(ui, duration(r.file.seconds), sel);
+                    }
+                    5 => {
+                        classic::cell(ui, &r.nick, sel);
+                    }
+                    6 => {
+                        classic::cell(ui, link_speed_name(r.link_speed), sel);
+                    }
+                    _ => {
+                        classic::cell(ui, "N/A", sel);
+                    }
+                }
+            },
+            Some(&mut menu),
+        );
+        if let Some(c) = out.header.filter(|&c| c < SORT_COLS.len()) {
+            let col = SORT_COLS[c];
+            self.search.sort = if self.search.sort.0 == col { (col, !self.search.sort.1) } else { (col, true) };
+            self.sort_results();
+        }
+        if let Some(i) = out.double {
+            let r = self.search.results[i].clone();
+            self.download(&r);
+        } else if let Some(i) = out.clicked {
+            toggle_select(ui, &mut self.search.selected, i);
+        }
         let n = self.search.results.len();
+        let text = if self.search.searching {
+            "Searching...".to_owned()
+        } else if n == 0 && self.search.artist.is_empty() && self.search.title.is_empty() {
+            String::new()
+        } else {
+            format!("Returned {n} results.")
+        };
+        classic::info_bar(ui, &text);
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.label(if self.search.searching { format!("{n} results so far...") } else { format!("Returned {n} results.") });
-            let sel = self.search.selected.len();
-            if ui.add_enabled(sel > 0, egui::Button::new(format!("Get Selected Files ({sel})"))).clicked() {
+            let w = (ui.available_width() - 6.0) / 2.0;
+            let any = !self.search.selected.is_empty();
+            if classic::button_ex(ui, "Get Selected Song(s)", Some(w), any, false).clicked() {
                 let picks: Vec<SearchResult> = self.search.selected.iter().map(|&i| self.search.results[i].clone()).collect();
                 for r in picks {
                     self.download(&r);
                 }
                 self.search.selected.clear();
             }
-        });
-        let mut clicked_header: Option<SortCol> = None;
-        let mut act: Option<(usize, &'static str)> = None;
-        let sort = self.search.sort;
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .column(Column::remainder().at_least(220.0).clip(true))
-            .column(Column::auto().at_least(70.0))
-            .column(Column::auto().at_least(50.0))
-            .column(Column::auto().at_least(55.0))
-            .column(Column::auto().at_least(55.0))
-            .column(Column::auto().at_least(90.0))
-            .column(Column::auto().at_least(80.0))
-            .header(20.0, |mut h| {
-                for (t, c) in [
-                    ("Filename", SortCol::File),
-                    ("Filesize", SortCol::Size),
-                    ("Bitrate", SortCol::Bitrate),
-                    ("Freq", SortCol::Freq),
-                    ("Length", SortCol::Length),
-                    ("User", SortCol::User),
-                    ("Connection", SortCol::Speed),
-                ] {
-                    h.col(|ui| {
-                        let arrow = if sort.0 == c { if sort.1 { " ▲" } else { " ▼" } } else { "" };
-                        if ui.add(egui::Label::new(RichText::new(format!("{t}{arrow}")).strong()).sense(egui::Sense::click())).clicked() {
-                            clicked_header = Some(c);
-                        }
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(18.0, n, |mut row| {
-                    let i = row.index();
-                    let r = &self.search.results[i];
-                    row.set_selected(self.search.selected.contains(&i));
-                    row.col(|ui| {
-                        ui.label(r.file.basename()).on_hover_text(&r.file.filename);
-                    });
-                    row.col(|ui| {
-                        ui.label(human_size(r.file.size));
-                    });
-                    row.col(|ui| {
-                        ui.label(r.file.bitrate.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(r.file.frequency.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(duration(r.file.seconds));
-                    });
-                    row.col(|ui| {
-                        ui.label(&r.nick);
-                    });
-                    row.col(|ui| {
-                        ui.label(link_speed_name(r.link_speed));
-                    });
-                    let resp = row.response();
-                    if resp.double_clicked() {
-                        act = Some((i, "get"));
-                    } else if resp.clicked() {
-                        act = Some((i, "select"));
-                    }
-                    resp.context_menu(|ui| {
-                        for (label, what) in [
-                            ("Get File", "get"),
-                            ("Browse User's Files", "browse"),
-                            ("Add User to Hot List", "hotlist"),
-                            ("Instant Message", "msg"),
-                            ("View User Information", "whois"),
-                        ] {
-                            if ui.button(label).clicked() {
-                                act = Some((i, what));
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                });
-            });
-        if let Some(c) = clicked_header {
-            self.search.sort = if self.search.sort.0 == c { (c, !self.search.sort.1) } else { (c, true) };
-            self.sort_results();
-        }
-        if let Some((i, what)) = act {
-            let ctrl = ui.input(|inp| inp.modifiers.command || inp.modifiers.shift);
-            match what {
-                "select" => {
-                    if !ctrl {
-                        self.search.selected.clear();
-                    }
-                    if !self.search.selected.remove(&i) {
-                        self.search.selected.insert(i);
-                    }
-                }
-                "get" => {
-                    let r = self.search.results[i].clone();
-                    self.download(&r);
-                }
-                other => {
-                    let nick = self.search.results[i].nick.clone();
-                    self.user_action(&nick, other);
+            if classic::button_ex(ui, "Add Selected User to Hot List", Some(w), any, false).clicked() {
+                let nicks: HashSet<String> = self.search.selected.iter().map(|&i| self.search.results[i].nick.clone()).collect();
+                for n in nicks {
+                    self.hotlist_add(&n);
                 }
             }
+        });
+        if let Some(a) = action.into_inner() {
+            self.apply(a);
         }
     }
 
-    fn hotlist_tab(&mut self, ui: &mut egui::Ui) {
-        let mut action: Option<(String, &'static str)> = None;
-        egui::SidePanel::left("hotlist_users").resizable(true).default_width(220.0).show_inside(ui, |ui| {
-            ui.strong("Hot List");
-            ui.horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.hotlist_input).hint_text("user name").desired_width(120.0));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Add").clicked() || enter {
-                    let n = std::mem::take(&mut self.hotlist_input);
-                    action = Some((n, "hotlist"));
-                }
-            });
-            ui.separator();
-            for (nick, online) in self.hotlist.values() {
-                let (dot, color) = match online {
-                    Some(_) => ("●", Color32::LIGHT_GREEN),
-                    None => ("○", Color32::GRAY),
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(dot).color(color));
-                    let r = ui.selectable_label(false, nick);
-                    let r = match online {
-                        Some(speed) => r.on_hover_text(link_speed_name(*speed)),
-                        None => r.on_hover_text("offline"),
-                    };
-                    if r.double_clicked() {
-                        action = Some((nick.clone(), "browse"));
-                    }
-                    r.context_menu(|ui| {
-                        for (label, what) in [
-                            ("Browse Files", "browse"),
-                            ("Instant Message", "msg"),
-                            ("View User Information", "whois"),
-                            ("Ping", "ping"),
-                            ("Remove from Hot List", "remove"),
-                        ] {
-                            if ui.button(label).clicked() {
-                                action = Some((nick.clone(), what));
-                                ui.close_menu();
+    fn hotlist_tab(&mut self, ui: &mut Ui) {
+        let action: RefCell<Option<Act>> = RefCell::new(None);
+        let h = ui.available_height();
+        let mut get: Vec<SearchResult> = vec![];
+        ui.horizontal_top(|ui| {
+            // left: the hot list
+            ui.vertical(|ui| {
+                ui.set_width(200.0);
+                classic::status_panel(ui, "Hot List", 200.0);
+                ui.add_space(2.0);
+                let selected = self.hotlist_selected.clone();
+                classic::sunken(ui, vec2(200.0, h - 82.0), Color32::WHITE, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for (key, (nick, online)) in &self.hotlist {
+                            let sel = selected.as_ref() == Some(key);
+                            let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), egui::Sense::click());
+                            if sel {
+                                ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, classic::NAVY);
                             }
+                            let color = if sel { Color32::WHITE } else { classic::TEXT };
+                            let dc = if online.is_some() { Color32::from_rgb(0x00, 0xb0, 0x00) } else { Color32::from_gray(0xb0) };
+                            let p = ui.painter();
+                            p.circle_filled(rect.left_center() + vec2(8.0, 0.0), 4.0, dc);
+                            p.circle_stroke(rect.left_center() + vec2(8.0, 0.0), 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(60)));
+                            let label = match online {
+                                Some(s) => format!("{nick} ({})", link_speed_name(*s)),
+                                None => nick.clone(),
+                            };
+                            p.text(
+                                rect.left_center() + vec2(18.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(12.0),
+                                color,
+                            );
+                            if r.double_clicked() {
+                                *action.borrow_mut() = Some(Act::User(nick.clone(), "browse"));
+                            } else if r.clicked() {
+                                *action.borrow_mut() = Some(Act::User(nick.clone(), "select"));
+                            }
+                            r.context_menu(|ui| {
+                                user_menu(ui, nick, &action);
+                                if ui.button("Remove User from Hot List").clicked() {
+                                    *action.borrow_mut() = Some(Act::User(nick.clone(), "remove"));
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     });
                 });
-            }
-            if self.hotlist.is_empty() {
-                ui.label("Add users to keep track of when they are online. Double-click to browse.");
-            }
-        });
-        // browse results
-        match &mut self.browse {
-            None => {
-                ui.label("Double-click a user to browse their files.");
-            }
-            Some(b) => {
-                let mut get: Vec<SearchResult> = vec![];
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.heading(format!("{}'s files", b.nick));
-                    if !b.done {
-                        ui.spinner();
-                        ui.label("Populating...");
-                    } else {
-                        ui.label(format!("{} files", b.results.len()));
+                    let r = classic::text_field_ex(ui, &mut self.hotlist_input, 130.0, false, "user name");
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if classic::button(ui, "Add", Some(64.0)).clicked() || enter {
+                        let n = std::mem::take(&mut self.hotlist_input);
+                        *action.borrow_mut() = Some(Act::User(n, "hotlist"));
                     }
-                    let sel = b.selected.len();
-                    if ui.add_enabled(sel > 0, egui::Button::new(format!("Get Selected Files ({sel})"))).clicked() {
-                        get = b.selected.iter().map(|&i| b.results[i].clone()).collect();
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    let nick = self.hotlist_selected.as_ref().and_then(|k| self.hotlist.get(k).map(|e| e.0.clone()));
+                    if classic::button_ex(ui, "Browse", Some(98.0), nick.is_some(), false).clicked() {
+                        *action.borrow_mut() = nick.clone().map(|n| Act::User(n, "browse"));
+                    }
+                    if classic::button_ex(ui, "Remove", Some(98.0), nick.is_some(), false).clicked() {
+                        *action.borrow_mut() = nick.map(|n| Act::User(n, "remove"));
+                    }
+                });
+            });
+            // right: the selected user's files
+            ui.vertical(|ui| {
+                let w = ui.available_width();
+                let title = match &self.browse {
+                    Some(b) => format!("{}'s Files", b.nick),
+                    None => "Double-click a user to see their files".into(),
+                };
+                classic::status_panel(ui, &title, w);
+                ui.add_space(2.0);
+                let empty = BrowseView { nick: String::new(), results: vec![], done: true, selected: HashSet::new() };
+                let b = self.browse.as_ref().unwrap_or(&empty);
+                let mut menu = |ui: &mut Ui, i: usize| {
+                    if ui.button("Get Song").clicked() {
+                        *action.borrow_mut() = Some(Act::Get(b.results[i].clone()));
+                        ui.close_menu();
+                    }
+                };
+                let out = list_view(
+                    ui,
+                    "browse",
+                    h - 82.0,
+                    &[("Filename", 0.0), ("Filesize", 85.0), ("Bitrate", 50.0), ("Freq", 52.0), ("Length", 50.0)],
+                    b.results.len(),
+                    |i| b.selected.contains(&i),
+                    |ui, i, c, sel| {
+                        let f = &b.results[i].file;
+                        let t = match c {
+                            0 => f.filename.clone(),
+                            1 => commas(f.size),
+                            2 => dash(f.bitrate),
+                            3 => dash(f.frequency),
+                            _ => duration(f.seconds),
+                        };
+                        classic::cell(ui, t, sel);
+                    },
+                    Some(&mut menu),
+                );
+                let text = match &self.browse {
+                    Some(b) if !b.done => format!("Populating list for User:  {}  ...", b.nick),
+                    Some(b) => format!("{} files.", commas(b.results.len() as u64)),
+                    None => String::new(),
+                };
+                classic::info_bar(ui, &text);
+                ui.add_space(3.0);
+                let any = self.browse.as_ref().is_some_and(|b| !b.selected.is_empty());
+                let w = ui.available_width();
+                let get_clicked = classic::button_ex(ui, "Get Selected Song(s)", Some(w), any, false).clicked();
+                if let Some(b) = &mut self.browse {
+                    if let Some(i) = out.double {
+                        get.push(b.results[i].clone());
+                    } else if let Some(i) = out.clicked {
+                        toggle_select(ui, &mut b.selected, i);
+                    }
+                    if get_clicked {
+                        get.extend(b.selected.iter().map(|&i| b.results[i].clone()));
                         b.selected.clear();
                     }
-                });
-                ui.separator();
-                let mut clicked: Option<(usize, bool)> = None;
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .sense(egui::Sense::click())
-                    .column(Column::remainder().at_least(240.0).clip(true))
-                    .column(Column::auto().at_least(70.0))
-                    .column(Column::auto().at_least(50.0))
-                    .column(Column::auto().at_least(55.0))
-                    .header(20.0, |mut h| {
-                        for t in ["Filename", "Size", "Bitrate", "Length"] {
-                            h.col(|ui| {
-                                ui.strong(t);
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(18.0, b.results.len(), |mut row| {
-                            let i = row.index();
-                            let r = &b.results[i];
-                            row.set_selected(b.selected.contains(&i));
-                            row.col(|ui| {
-                                ui.label(&r.file.filename);
-                            });
-                            row.col(|ui| {
-                                ui.label(human_size(r.file.size));
-                            });
-                            row.col(|ui| {
-                                ui.label(r.file.bitrate.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(duration(r.file.seconds));
-                            });
-                            let resp = row.response();
-                            if resp.double_clicked() {
-                                clicked = Some((i, true));
-                            } else if resp.clicked() {
-                                clicked = Some((i, false));
-                            }
-                        });
-                    });
-                if let Some((i, dbl)) = clicked {
-                    if dbl {
-                        get.push(b.results[i].clone());
-                    } else if !b.selected.remove(&i) {
-                        b.selected.insert(i);
-                    }
                 }
-                for r in get {
-                    self.download(&r);
-                }
-            }
+            });
+        });
+        for r in get {
+            self.download(&r);
         }
-        if let Some((nick, what)) = action {
-            match what {
-                "remove" => self.hotlist_remove(&nick),
-                other => self.user_action(&nick, other),
-            }
+        if let Some(a) = action.into_inner() {
+            self.apply(a);
         }
     }
 
-    fn transfer_tab(&mut self, ui: &mut egui::Ui) {
+    fn transfer_tab(&mut self, ui: &mut Ui) {
+        let list_h = (ui.available_height() - 64.0) / 2.0;
+        let mut clicked: Option<u64> = None;
+        let mut opened: Option<PathBuf> = None;
+        for dir in [Direction::Download, Direction::Upload] {
+            let rows: Vec<&TransferInfo> = self.transfers.values().filter(|t| t.direction == dir).collect();
+            let sel = self.selected_transfer;
+            let speeds = &self.speeds;
+            let out = list_view(
+                ui,
+                if dir == Direction::Download { "downloads" } else { "uploads" },
+                list_h,
+                &[
+                    ("Filename", 0.0),
+                    ("File Size", 140.0),
+                    ("User", 90.0),
+                    ("Status", 110.0),
+                    ("Speed", 60.0),
+                    ("Progress", 104.0),
+                    ("Rate", 64.0),
+                    ("Time Left", 66.0),
+                ],
+                rows.len(),
+                |i| sel == Some(rows[i].id),
+                |ui, i, c, s| {
+                    let t = rows[i];
+                    match c {
+                        0 => {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                let arrow = if t.direction == Direction::Download { "⬇" } else { "⬆" };
+                                let color = if s { Color32::WHITE } else { classic::TEXT };
+                                ui.label(RichText::new(arrow).color(color).size(11.0));
+                                classic::cell(ui, t.basename(), s).on_hover_text(&t.filename);
+                            });
+                        }
+                        1 => {
+                            let done = t.offset + t.transferred;
+                            let text = if t.state.is_finished() || done == 0 {
+                                commas(t.size)
+                            } else {
+                                format!("{} of {}", commas(done), commas(t.size))
+                            };
+                            classic::cell(ui, text, s);
+                        }
+                        2 => {
+                            classic::cell(ui, &t.nick, s);
+                        }
+                        3 => {
+                            let r = classic::cell(ui, status_label(t), s);
+                            if let TransferState::Failed(why) = &t.state {
+                                r.on_hover_text(why);
+                            }
+                        }
+                        4 => {
+                            let sp = speeds.get(&t.nick.to_lowercase()).map(|s| short_speed(*s)).unwrap_or("Unknown");
+                            classic::cell(ui, sp, s);
+                        }
+                        5 => {
+                            if matches!(t.state, TransferState::Transferring | TransferState::Complete) || t.transferred > 0 {
+                                let color = if t.direction == Direction::Download { classic::BAR_BLUE } else { classic::BAR_YELLOW };
+                                classic::progress(ui, t.progress(), color, 96.0);
+                            }
+                        }
+                        6 => {
+                            if t.state == TransferState::Transferring {
+                                classic::cell(ui, format!("{:.2} k/s", t.rate() / 1024.0), s);
+                            }
+                        }
+                        _ => {
+                            if t.state == TransferState::Transferring && t.rate() > 1.0 {
+                                let left = t.size.saturating_sub(t.offset + t.transferred) as f64 / t.rate();
+                                classic::cell(ui, hms(left as u64), s);
+                            }
+                        }
+                    }
+                },
+                None,
+            );
+            if let Some(i) = out.clicked {
+                clicked = Some(rows[i].id);
+            }
+            if let Some(i) = out.double {
+                opened = rows[i].saved_to.clone();
+            }
+            ui.add_space(4.0);
+        }
+        if clicked.is_some() {
+            self.selected_transfer = clicked;
+        }
+        if let Some(p) = opened {
+            open_path(&p);
+        }
+        let active = |d: Direction| self.transfers.values().filter(|t| t.direction == d && !t.state.is_finished()).count();
+        classic::info_bar(
+            ui,
+            &format!(
+                "Concurrent Downloads:   {}            Concurrent Uploads:   {}",
+                active(Direction::Download),
+                active(Direction::Upload)
+            ),
+        );
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            if ui.button("Clear Finished").clicked() {
+            let w = (ui.available_width() - 6.0) / 2.0;
+            if classic::button(ui, "Clear Finished", Some(w)).clicked() {
                 self.client.send(Command::ClearFinished);
             }
-            if ui.button("Open Downloads Folder").clicked() {
-                open_path(&self.config.download_dir);
+            let can_cancel = self
+                .selected_transfer
+                .and_then(|id| self.transfers.get(&id))
+                .is_some_and(|t| !t.state.is_finished());
+            if classic::button_ex(ui, "Cancel", Some(w), can_cancel, false).clicked() {
+                if let Some(id) = self.selected_transfer {
+                    self.client.send(Command::CancelTransfer(id));
+                }
             }
         });
-        let half = (ui.available_height() - 40.0) / 2.0;
-        let mut cancel: Option<u64> = None;
-        let mut retry: Option<TransferInfo> = None;
-        for (dir, title) in [(Direction::Download, "Downloads"), (Direction::Upload, "Uploads")] {
-            let rows: Vec<&TransferInfo> = self.transfers.values().filter(|t| t.direction == dir).collect();
-            let active = rows.iter().filter(|t| !t.state.is_finished()).count();
-            ui.separator();
-            ui.strong(format!("{title} ({active} active)"));
-            ui.push_id(title, |ui| {
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .max_scroll_height(half)
-                    .column(Column::remainder().at_least(200.0).clip(true))
-                    .column(Column::auto().at_least(90.0))
-                    .column(Column::auto().at_least(150.0))
-                    .column(Column::auto().at_least(80.0))
-                    .column(Column::auto().at_least(150.0))
-                    .column(Column::auto().at_least(60.0))
-                    .header(20.0, |mut h| {
-                        for t in ["Filename", "User", "Progress", "Rate", "Status", ""] {
-                            h.col(|ui| {
-                                ui.strong(t);
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(20.0, rows.len(), |mut row| {
-                            let t = rows[row.index()];
-                            row.col(|ui| {
-                                ui.label(t.basename()).on_hover_text(&t.filename);
-                            });
-                            row.col(|ui| {
-                                ui.label(&t.nick);
-                            });
-                            row.col(|ui| {
-                                ui.add(egui::ProgressBar::new(t.progress()).text(format!(
-                                    "{} / {}",
-                                    human_size(t.offset + t.transferred),
-                                    human_size(t.size)
-                                )));
-                            });
-                            row.col(|ui| {
-                                if t.state == TransferState::Transferring {
-                                    ui.label(format!("{}/s", human_size(t.rate() as u64)));
-                                }
-                            });
-                            row.col(|ui| {
-                                let color = match &t.state {
-                                    TransferState::Complete => Color32::LIGHT_GREEN,
-                                    TransferState::Failed(_) => ERROR,
-                                    _ => ui.visuals().text_color(),
-                                };
-                                ui.label(RichText::new(t.state.label()).color(color)).on_hover_text(t.state.label());
-                            });
-                            row.col(|ui| {
-                                if !t.state.is_finished() {
-                                    if ui.small_button("Cancel").clicked() {
-                                        cancel = Some(t.id);
-                                    }
-                                } else if t.direction == Direction::Download {
-                                    if let Some(p) = &t.saved_to {
-                                        if ui.small_button("Open").clicked() {
-                                            open_path(p);
-                                        }
-                                    } else if ui.small_button("Retry").clicked() {
-                                        retry = Some(t.clone());
-                                    }
-                                }
-                            });
-                        });
-                    });
-            });
-        }
-        if let Some(id) = cancel {
-            self.client.send(Command::CancelTransfer(id));
-        }
-        if let Some(t) = retry {
-            self.client.send(Command::Download {
-                nick: t.nick.clone(),
-                file: FileInfo { filename: t.filename.clone(), md5: t.md5.clone(), size: t.size, bitrate: 0, frequency: 0, seconds: 0 },
-            });
-        }
     }
 
-    fn discover_tab(&mut self, ui: &mut egui::Ui) {
+    fn discover_tab(&mut self, ui: &mut Ui) {
+        classic::status_panel(ui, "Chat Rooms", ui.available_width());
+        ui.add_space(2.0);
+        let rows = &self.channel_list;
+        let joined: HashSet<String> = self
+            .chats
+            .keys()
+            .filter_map(|k| match k {
+                ChatKey::Channel(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let sel = self.channel_selected;
+        let out = list_view(
+            ui,
+            "channels",
+            ui.available_height() - 58.0,
+            &[("Channel Name", 170.0), ("User Count", 80.0), ("Channel Topic", 0.0)],
+            rows.len(),
+            |i| sel == Some(i),
+            |ui, i, c, s| {
+                let (name, users, topic) = &rows[i];
+                match c {
+                    0 => {
+                        let t = if joined.contains(&name.to_lowercase()) { format!("{name}  (joined)") } else { name.clone() };
+                        classic::cell(ui, t, s);
+                    }
+                    1 => {
+                        classic::cell(ui, users.to_string(), s);
+                    }
+                    _ => {
+                        classic::cell(ui, topic, s);
+                    }
+                }
+            },
+            None,
+        );
+        let mut join: Option<String> = None;
+        if let Some(i) = out.clicked {
+            self.channel_selected = Some(i);
+        }
+        if let Some(i) = out.double {
+            join = Some(self.channel_list[i].0.clone());
+        }
+        let total: u32 = self.channel_list.iter().map(|c| c.1).sum();
+        classic::info_bar(ui, &format!("{} channels, {} users chatting.", self.channel_list.len(), total));
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.heading("Chat Rooms");
-            if ui.button("Refresh").clicked() {
+            let can_join = self.channel_selected.is_some();
+            if classic::button_ex(ui, "Join", Some(100.0), can_join, false).clicked() {
+                join = self.channel_selected.map(|i| self.channel_list[i].0.clone());
+            }
+            if classic::button(ui, "Refresh", Some(100.0)).clicked() {
                 self.client.send(Command::ListChannels);
             }
-            ui.add(egui::TextEdit::singleline(&mut self.channel_filter).hint_text("filter").desired_width(160.0));
-            ui.separator();
-            let r = ui.add(egui::TextEdit::singleline(&mut self.new_channel).hint_text("new room name").desired_width(140.0));
+            ui.add_space(20.0);
+            ui.label("Create:");
+            let r = classic::text_field_ex(ui, &mut self.new_channel, 160.0, false, "new room name");
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Create / Join").clicked() || enter) && !self.new_channel.trim().is_empty() {
-                let name = std::mem::take(&mut self.new_channel).trim().replace(' ', "_");
-                self.client.send(Command::Join(name));
+            if (classic::button(ui, "Create", Some(90.0)).clicked() || enter) && !self.new_channel.trim().is_empty() {
+                join = Some(std::mem::take(&mut self.new_channel).trim().replace(' ', "_"));
             }
         });
-        if !self.online() {
-            ui.label("Not connected to Server!");
-            return;
-        }
-        ui.separator();
-        let filter = self.channel_filter.to_lowercase();
-        let rows: Vec<(String, u32, String)> = self
-            .channel_list
-            .iter()
-            .filter(|(n, _, t)| filter.is_empty() || n.to_lowercase().contains(&filter) || t.to_lowercase().contains(&filter))
-            .cloned()
-            .collect();
-        let mut join: Option<String> = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .column(Column::auto().at_least(160.0))
-            .column(Column::auto().at_least(80.0))
-            .column(Column::remainder().clip(true))
-            .header(20.0, |mut h| {
-                for t in ["Channel Name", "User Count", "Channel Topic"] {
-                    h.col(|ui| {
-                        ui.strong(t);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(18.0, rows.len(), |mut row| {
-                    let (name, users, topic) = &rows[row.index()];
-                    let joined = self.chats.contains_key(&ChatKey::Channel(name.to_lowercase()));
-                    row.col(|ui| {
-                        ui.label(if joined { RichText::new(name).strong().color(ACCENT) } else { RichText::new(name) });
-                    });
-                    row.col(|ui| {
-                        ui.label(users.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(topic);
-                    });
-                    if row.response().double_clicked() {
-                        join = Some(name.clone());
-                    }
-                });
-            });
-        ui.label("Double-click a room to join it.");
         if let Some(name) = join {
             self.client.send(Command::Join(name));
         }
     }
 
-    fn whois_window(&mut self, ctx: &egui::Context) {
-        let Some(fields) = &self.whois else { return };
-        let title = fields.first().map(|(_, v)| format!("{v}'s Finger Information")).unwrap_or_default();
-        let mut open = true;
-        egui::Window::new(title).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
-            egui::Grid::new("whois").num_columns(2).striped(true).show(ui, |ui| {
-                for (k, v) in fields {
-                    ui.strong(k);
-                    ui.label(v);
-                    ui.end_row();
-                }
+    fn help_tab(&mut self, ui: &mut Ui) {
+        let (w, h) = (ui.available_width(), ui.available_height());
+        classic::sunken(ui, vec2(w, h), Color32::WHITE, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(w - 40.0);
+                        classic::wordmark(ui, 46.0, false);
+                        ui.add_space(6.0);
+                        ui.label(bold(format!("{} — a Rust rebuild of Napster v2.0 BETA 10", napster_core::CLIENT_INFO)));
+                        ui.add_space(10.0);
+                        for (title, body) in HELP {
+                            ui.label(bold(*title));
+                            ui.label(*body);
+                            ui.add_space(8.0);
+                        }
+                    });
+                });
             });
         });
-        if !open {
+    }
+
+    fn whois_window(&mut self, ctx: &egui::Context) {
+        let Some(fields) = self.whois.clone() else { return };
+        let nick = fields.first().map(|(_, v)| v.clone()).unwrap_or_default();
+        let mut open = true;
+        let mut close = false;
+        classic::dialog(ctx, "whois", &format!("{nick}'s Finger Information"), &mut open, 330.0, |ui| {
+            classic::group(ui, "User Information", |ui| {
+                egui::Grid::new("whois_grid").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                    for (k, v) in &fields {
+                        ui.label(format!("{k}:"));
+                        ui.label(v);
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                close = classic::button(ui, "OK", Some(84.0)).clicked();
+            });
+        });
+        if close || !open {
             self.whois = None;
         }
     }
 
     fn prefs_window(&mut self, ctx: &egui::Context) {
-        let Some(draft) = &mut self.prefs else { return };
+        let Some(mut draft) = self.prefs.take() else { return };
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Preferences").open(&mut open).collapsible(false).default_width(520.0).show(ctx, |ui| {
-            egui::CollapsingHeader::new("Account").default_open(true).show(ui, |ui| {
-                egui::Grid::new("acct").num_columns(2).show(ui, |ui| {
+        classic::dialog(ctx, "prefs", "Napster Preferences", &mut open, 560.0, |ui| {
+            let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), egui::Sense::hover());
+            ui.painter().rect_filled(banner, egui::CornerRadius::ZERO, Color32::BLACK);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(banner.shrink2(vec2(150.0, 6.0))));
+            classic::wordmark(&mut child, 50.0, true);
+            ui.add_space(4.0);
+            let fw = 170.0;
+            classic::group(ui, "Miscellaneous Settings", |ui| {
+                egui::Grid::new("misc").num_columns(4).spacing([8.0, 5.0]).show(ui, |ui| {
                     ui.label("User Name:");
-                    ui.text_edit_singleline(&mut draft.nick);
+                    classic::text_field(ui, &mut draft.nick, fw);
+                    ui.label("Data Port:");
+                    let mut port = draft.data_port.to_string();
+                    if classic::text_field(ui, &mut port, 70.0).changed() {
+                        draft.data_port = port.trim().parse().unwrap_or(0);
+                    }
                     ui.end_row();
+
                     ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-                    ui.end_row();
-                    ui.label("Email:");
-                    ui.text_edit_singleline(&mut draft.email);
-                    ui.end_row();
-                    ui.label("Connection:");
+                    classic::text_field_ex(ui, &mut draft.password, fw, true, "");
+                    ui.label("Line Speed:");
                     egui::ComboBox::from_id_salt("speed")
+                        .width(110.0)
                         .selected_text(link_speed_name(draft.link_speed))
                         .show_ui(ui, |ui| {
                             for (i, name) in LINK_SPEEDS.iter().enumerate() {
@@ -1455,115 +1653,222 @@ impl App {
                             }
                         });
                     ui.end_row();
+
+                    ui.label("Email:");
+                    classic::text_field(ui, &mut draft.email, fw);
+                    ui.end_row();
                 });
                 if !draft.nick.is_empty() && !napster_proto::valid_nick(&draft.nick) {
-                    ui.colored_label(ERROR, "User names may use letters, digits and _[]{}-@^!$");
+                    ui.colored_label(C_ERROR, "Name contains invalid characters! Please choose another name!");
                 }
-                ui.label(RichText::new("New user names are registered automatically on first login.").weak());
-            });
-            egui::CollapsingHeader::new("Server").default_open(true).show(ui, |ui| {
-                egui::Grid::new("srv").num_columns(2).show(ui, |ui| {
-                    ui.label("Server (host:port):");
-                    ui.text_edit_singleline(&mut draft.server);
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut draft.use_metaserver, "This is a metaserver (port 8875 redirector)");
-                    ui.end_row();
-                    ui.label("Data port:");
-                    ui.add(egui::DragValue::new(&mut draft.data_port).range(0..=65535));
-                    ui.end_row();
-                });
-                ui.label(RichText::new("Data port 0 = behind a firewall (others can't connect to you; uploads are pushed).").weak());
-                ui.checkbox(&mut draft.auto_connect, "Connect automatically when Napster starts");
-            });
-            egui::CollapsingHeader::new("Shared Folders").default_open(true).show(ui, |ui| {
-                let mut remove = None;
-                for (i, d) in draft.shared_dirs.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("✖").clicked() {
-                            remove = Some(i);
-                        }
-                        ui.label(d.display().to_string());
-                    });
-                }
-                if let Some(i) = remove {
-                    draft.shared_dirs.remove(i);
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Add Folder...").clicked() {
+                ui.add_space(4.0);
+                egui::Grid::new("paths").num_columns(3).spacing([8.0, 5.0]).show(ui, |ui| {
+                    ui.label("Library Paths:");
+                    let mut paths = draft.shared_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
+                    if classic::text_field(ui, &mut paths, 300.0).changed() {
+                        draft.shared_dirs = paths.split(';').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+                    }
+                    if classic::button(ui, "Add Path", Some(90.0)).clicked() {
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             draft.shared_dirs.push(p);
                         }
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.new_shared_dir).hint_text("or type a path").desired_width(220.0));
-                    if ui.button("Add").clicked() && !self.new_shared_dir.trim().is_empty() {
-                        draft.shared_dirs.push(PathBuf::from(std::mem::take(&mut self.new_shared_dir).trim()));
+                    ui.end_row();
+                    ui.label("Save Directory:");
+                    let mut dl = draft.download_dir.display().to_string();
+                    if classic::text_field(ui, &mut dl, 300.0).changed() {
+                        draft.download_dir = PathBuf::from(dl);
                     }
+                    if classic::button(ui, "Choose Dir.", Some(90.0)).clicked() {
+                        if let Some(p) = rfd::FileDialog::new().set_directory(&draft.download_dir).pick_folder() {
+                            draft.download_dir = p;
+                        }
+                    }
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.checkbox(&mut draft.auto_connect, "Connect to the Server when Napster starts");
+            });
+            ui.add_space(6.0);
+            classic::group(ui, "Server Settings", |ui| {
+                egui::Grid::new("srv").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                    ui.label("Server (host:port):");
+                    classic::text_field(ui, &mut draft.server, 240.0);
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut draft.use_metaserver, "This is a metaserver (redirector, port 8875)");
+                    ui.end_row();
                 });
             });
-            egui::CollapsingHeader::new("Transfers").default_open(true).show(ui, |ui| {
-                egui::Grid::new("xfer").num_columns(2).show(ui, |ui| {
-                    ui.label("Download folder:");
-                    ui.horizontal(|ui| {
-                        ui.label(draft.download_dir.display().to_string());
-                        if ui.small_button("Change...").clicked() {
-                            if let Some(p) = rfd::FileDialog::new().set_directory(&draft.download_dir).pick_folder() {
-                                draft.download_dir = p;
-                            }
-                        }
-                    });
+            ui.add_space(6.0);
+            classic::group(ui, "Transfer Settings", |ui| {
+                egui::Grid::new("xfer").num_columns(2).spacing([8.0, 5.0]).show(ui, |ui| {
+                    ui.label("Max Simultaneous Uploads:");
+                    let mut up = draft.max_uploads.to_string();
+                    if classic::text_field(ui, &mut up, 50.0).changed() {
+                        draft.max_uploads = up.trim().parse().unwrap_or(0).min(50);
+                    }
                     ui.end_row();
-                    ui.label("Max simultaneous downloads:");
-                    ui.add(egui::DragValue::new(&mut draft.max_downloads).range(1..=50));
+                    ui.label("Max Upload Speed per transfer (KB/s, 0 = unlimited):");
+                    let mut lim = draft.upload_limit_kbps.to_string();
+                    if classic::text_field(ui, &mut lim, 50.0).changed() {
+                        draft.upload_limit_kbps = lim.trim().parse().unwrap_or(0);
+                    }
                     ui.end_row();
-                    ui.label("Max simultaneous uploads:");
-                    ui.add(egui::DragValue::new(&mut draft.max_uploads).range(0..=50));
+                    ui.label("Max Simultaneous Downloads (rest will be queued):");
+                    let mut down = draft.max_downloads.to_string();
+                    if classic::text_field(ui, &mut down, 50.0).changed() {
+                        draft.max_downloads = down.trim().parse().unwrap_or(1).clamp(1, 50);
+                    }
                     ui.end_row();
                 });
                 if draft.max_uploads == 0 {
-                    ui.colored_label(SYSTEM, "Your file server is disabled (max uploads = 0).");
+                    ui.colored_label(C_ERROR, "Your file server is currently disabled (max outbound transfers = 0).");
                 }
+                ui.label(
+                    RichText::new("Data Port 0 means you are behind a firewall; your uploads will be pushed.")
+                        .color(classic::DISABLED),
+                );
             });
-            ui.separator();
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    save = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
+                ui.add_space(ui.available_width() - 2.0 * 84.0 - 12.0);
+                save = classic::button(ui, "OK", Some(84.0)).clicked();
+                cancel = classic::button(ui, "Cancel", Some(84.0)).clicked();
             });
         });
         if save {
-            let draft = self.prefs.take().unwrap();
             self.config = draft;
             self.save_config();
             self.client.send(Command::SetConfig(self.config.clone()));
             self.log(Line::sys("Preferences saved."));
-        } else if cancel || !open {
-            self.prefs = None;
+        } else if !cancel && open {
+            self.prefs = Some(draft);
         }
+    }
+
+    // ------------------------------------------------------------ snapshots
+
+    fn drive_snapshots(&mut self, ctx: &egui::Context) {
+        let Some(mut s) = self.snap.take() else { return };
+        ctx.request_repaint();
+        match s.phase {
+            Phase::Starting => {
+                if (self.online() && !self.library.is_empty()) || s.elapsed().as_secs() > 8 {
+                    self.client.send(Command::Join("Lobby".into()));
+                    self.search.artist = s.search.clone();
+                    self.start_search();
+                    s.go(Phase::Searching);
+                }
+            }
+            Phase::Searching => {
+                if !self.search.searching || s.elapsed().as_secs() > 5 {
+                    let picks: Vec<SearchResult> = self.search.results.iter().take(3).cloned().collect();
+                    for r in &picks {
+                        self.download(r);
+                    }
+                    if let Some(r) = picks.first() {
+                        self.hotlist_add(&r.nick);
+                        self.browse(&r.nick);
+                        self.client.send(Command::Whois(r.nick.clone()));
+                    }
+                    self.search.selected.insert(1);
+                    s.go(Phase::Settling);
+                }
+            }
+            Phase::Settling => {
+                if s.elapsed().as_millis() > 2500 {
+                    s.go(Phase::Show(0));
+                }
+            }
+            Phase::Show(i) => {
+                let shot = snapshot::ORDER[i];
+                // the whois window should only appear in its own shot
+                let stashed = self.whois.take().or(self.snap_whois.take());
+                self.prefs = None;
+                self.force_splash = false;
+                match shot {
+                    Shot::Home => self.tab = Tab::Home,
+                    Shot::Chat | Shot::Whois => self.tab = Tab::Chat,
+                    Shot::Library => self.tab = Tab::Library,
+                    Shot::Search => self.tab = Tab::Search,
+                    Shot::HotList => self.tab = Tab::HotList,
+                    Shot::Transfer => {
+                        self.tab = Tab::Transfer;
+                        self.selected_transfer = self.transfers.keys().next().copied();
+                    }
+                    Shot::Discover => self.tab = Tab::Discover,
+                    Shot::Help => self.tab = Tab::Help,
+                    Shot::Prefs => {
+                        self.tab = Tab::Search;
+                        self.prefs = Some(self.config.clone());
+                    }
+                    Shot::Splash => {
+                        self.tab = Tab::Home;
+                        self.force_splash = true;
+                    }
+                }
+                if shot == Shot::Whois {
+                    self.whois = stashed.or(Some(vec![("User".into(), "(none)".into())]));
+                } else {
+                    self.snap_whois = stashed;
+                }
+                if s.elapsed().as_millis() > 700 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(shot.name().to_owned())));
+                    s.go(Phase::Capture(i));
+                }
+            }
+            Phase::Capture(i) => {
+                let got = ctx.input(|inp| {
+                    inp.raw.events.iter().find_map(|e| match e {
+                        egui::Event::Screenshot { user_data, image, .. } => {
+                            let name = user_data.data.as_ref().and_then(|d| d.downcast_ref::<String>()).cloned();
+                            Some((name, image.clone()))
+                        }
+                        _ => None,
+                    })
+                });
+                if let Some((name, image)) = got {
+                    let name = name.unwrap_or_else(|| format!("shot-{i}"));
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+                    let path = s.dir.join(format!("{name}.png"));
+                    if let Err(e) = snapshot::write_png(&path, image.size[0], image.size[1], &rgba) {
+                        tracing::error!("saving {}: {e}", path.display());
+                    }
+                    s.go(if i + 1 < snapshot::ORDER.len() { Phase::Show(i + 1) } else { Phase::Done });
+                } else if s.elapsed().as_secs() > 5 {
+                    tracing::error!("screenshot {i} never arrived");
+                    s.go(Phase::Done);
+                }
+            }
+            Phase::Done => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+        self.snap = Some(s);
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drive_snapshots(ctx);
         self.menu_bar(ctx);
         self.tab_bar(ctx);
         self.status_bar(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Home => self.home(ui),
-            Tab::Chat => self.chat_tab(ui),
-            Tab::Library => self.library_tab(ui),
-            Tab::Search => self.search_tab(ui),
-            Tab::HotList => self.hotlist_tab(ui),
-            Tab::Transfer => self.transfer_tab(ui),
-            Tab::Discover => self.discover_tab(ui),
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(classic::FACE).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 6 }))
+            .show(ctx, |ui| match self.tab {
+                Tab::Home => self.home(ui),
+                Tab::Chat => self.chat_tab(ui),
+                Tab::Library => self.library_tab(ui),
+                Tab::Search => self.search_tab(ui),
+                Tab::HotList => self.hotlist_tab(ui),
+                Tab::Transfer => self.transfer_tab(ui),
+                Tab::Discover => self.discover_tab(ui),
+                Tab::Help => self.help_tab(ui),
+            });
         self.whois_window(ctx);
         self.prefs_window(ctx);
-        // keep transfer rates ticking
+        self.splash(ctx);
         if self.transfers.values().any(|t| t.state == TransferState::Transferring) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -1574,59 +1879,194 @@ impl eframe::App for App {
     }
 }
 
-fn line_ui(ui: &mut egui::Ui, l: &Line) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        if let Some(who) = &l.who {
-            ui.label(RichText::new(format!("<{who}>")).color(ACCENT).strong());
-        }
-        match l.color {
-            Some(c) => ui.label(RichText::new(&l.text).color(c)),
-            None => ui.label(&l.text),
-        };
-    });
+// ------------------------------------------------------------------ helpers
+
+/// Right-click menu for a list row.
+type RowMenu<'a> = &'a mut dyn FnMut(&mut Ui, usize);
+
+struct ListOut {
+    clicked: Option<usize>,
+    double: Option<usize>,
+    header: Option<usize>,
 }
 
-fn compare_filter(
-    ui: &mut egui::Ui,
+/// A classic list view: sunken white box, raised column headers, navy
+/// selection. Column width 0 means "take the remaining space".
+#[allow(clippy::too_many_arguments)]
+fn list_view(
+    ui: &mut Ui,
+    id: &str,
+    height: f32,
+    cols: &[(&str, f32)],
+    rows: usize,
+    is_selected: impl Fn(usize) -> bool,
+    mut cell: impl FnMut(&mut Ui, usize, usize, bool),
+    mut menu: Option<RowMenu<'_>>,
+) -> ListOut {
+    let mut out = ListOut { clicked: None, double: None, header: None };
+    let width = ui.available_width();
+    let height = height.max(60.0);
+    classic::sunken(ui, vec2(width, height), Color32::WHITE, |ui| {
+        ui.push_id(id, |ui| {
+            let mut tb = TableBuilder::new(ui)
+                .striped(false)
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .auto_shrink([false; 2])
+                .max_scroll_height(height - 24.0)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for (_, w) in cols {
+                tb = if *w == 0.0 {
+                    tb.column(Column::remainder().at_least(120.0).clip(true))
+                } else {
+                    tb.column(Column::initial(*w).at_least(30.0).clip(true))
+                };
+            }
+            tb.header(19.0, |mut h| {
+                for (i, (t, _)) in cols.iter().enumerate() {
+                    h.col(|ui| {
+                        if classic::header_cell(ui, t).clicked() {
+                            out.header = Some(i);
+                        }
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(classic::ROW_H, rows, |mut row| {
+                    let i = row.index();
+                    let sel = is_selected(i);
+                    row.set_selected(sel);
+                    for c in 0..cols.len() {
+                        row.col(|ui| cell(ui, i, c, sel));
+                    }
+                    let r = row.response();
+                    if r.double_clicked() {
+                        out.double = Some(i);
+                    } else if r.clicked() {
+                        out.clicked = Some(i);
+                    }
+                    if let Some(m) = menu.as_mut() {
+                        r.context_menu(|ui| m(ui, i));
+                    }
+                });
+            });
+        });
+    });
+    out
+}
+
+fn user_menu(ui: &mut Ui, nick: &str, action: &RefCell<Option<Act>>) {
+    for (label, what) in [
+        ("Instant Message", "msg"),
+        ("Browse User's Files", "browse"),
+        ("View User Information", "whois"),
+        ("Add User to Hot List", "hotlist"),
+        ("Ping User", "ping"),
+        ("Ignore User", "ignore"),
+    ] {
+        if ui.button(label).clicked() {
+            *action.borrow_mut() = Some(Act::User(nick.to_owned(), what));
+            ui.close_menu();
+        }
+    }
+}
+
+/// Ctrl/Shift-click adds to the selection, plain click replaces it.
+fn toggle_select(ui: &Ui, set: &mut HashSet<usize>, i: usize) {
+    let multi = ui.input(|inp| inp.modifiers.command || inp.modifiers.shift);
+    if !multi {
+        let only_this = set.len() == 1 && set.contains(&i);
+        set.clear();
+        if only_this {
+            return;
+        }
+    }
+    if !set.remove(&i) {
+        set.insert(i);
+    }
+}
+
+fn compare_row(
+    ui: &mut Ui,
     label: &str,
     id: &str,
-    value: &mut Option<(Compare, u32)>,
+    value: &mut (Option<Compare>, u32),
+    width: f32,
     choices: &[u32],
     fmt: impl Fn(u32) -> String,
 ) {
-    ui.group(|ui| {
-        let mut on = value.is_some();
-        if ui.checkbox(&mut on, label).changed() {
-            *value = on.then(|| (Compare::AtLeast, choices[choices.len() / 2]));
+    ui.label(label);
+    egui::ComboBox::from_id_salt((id, "cmp"))
+        .width(width)
+        .selected_text(value.0.map(|c| c.as_str()).unwrap_or(""))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut value.0, None, "");
+            for c in Compare::ALL {
+                ui.selectable_value(&mut value.0, Some(c), c.as_str());
+            }
+        });
+    egui::ComboBox::from_id_salt((id, "val"))
+        .width(width)
+        .selected_text(if value.0.is_some() { fmt(value.1) } else { String::new() })
+        .show_ui(ui, |ui| {
+            for &c in choices {
+                ui.selectable_value(&mut value.1, c, fmt(c));
+            }
+        });
+    ui.end_row();
+}
+
+/// Colored dot in front of search results, as in BETA 5: green for fast
+/// connections, yellow for medium, red for modems.
+fn speed_dot(ui: &mut Ui, speed: u32) {
+    let color = match speed {
+        7..=10 => Color32::from_rgb(0x00, 0xa0, 0x00),
+        4..=6 => Color32::from_rgb(0xe0, 0xc0, 0x00),
+        1..=3 => Color32::from_rgb(0xd0, 0x00, 0x00),
+        _ => Color32::from_rgb(0x90, 0x90, 0x90),
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+    ui.painter().circle_stroke(rect.center(), 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(60)));
+}
+
+fn line_ui(ui: &mut Ui, l: &Line) {
+    ui.spacing_mut().item_spacing.y = 1.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if let Some((who, c)) = &l.who {
+            ui.label(bold(format!("<{who}>")).color(*c));
         }
-        if let Some((cmp, v)) = value {
-            egui::ComboBox::from_id_salt((id, "cmp")).selected_text(cmp.as_str()).show_ui(ui, |ui| {
-                for c in Compare::ALL {
-                    ui.selectable_value(cmp, c, c.as_str());
-                }
-            });
-            egui::ComboBox::from_id_salt((id, "val")).selected_text(fmt(*v)).show_ui(ui, |ui| {
-                for &c in choices {
-                    ui.selectable_value(v, c, fmt(c));
-                }
-            });
-        }
+        ui.label(RichText::new(&l.text).color(l.color));
     });
 }
 
-fn human_size(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
+fn status_label(t: &TransferInfo) -> String {
+    match (&t.state, t.direction) {
+        (TransferState::Queued, _) => "Queued".into(),
+        (TransferState::Requesting, _) => "Getting Info...".into(),
+        (TransferState::Connecting, _) => "Connecting...".into(),
+        (TransferState::WaitingForPush, _) => "Waiting through Firewall".into(),
+        (TransferState::Transferring, Direction::Download) => "Downloading...".into(),
+        (TransferState::Transferring, Direction::Upload) => "Uploading...".into(),
+        (TransferState::Complete, _) => "File Complete!".into(),
+        (TransferState::Cancelled, _) => "Cancelled".into(),
+        (TransferState::Failed(why), _) => why.clone(),
     }
-    if u == 0 {
-        format!("{n} B")
+}
+
+fn short_speed(s: u32) -> &'static str {
+    ["Unknown", "14.4", "28.8", "33.6", "56K", "ISDN-64", "ISDN-128", "Cable", "DSL", "T1", "T3"]
+        .get(s as usize)
+        .copied()
+        .unwrap_or("Unknown")
+}
+
+fn dash(n: u32) -> String {
+    if n == 0 {
+        "-".into()
     } else {
-        format!("{v:.1} {}", UNITS[u])
+        n.to_string()
     }
 }
 
@@ -1635,6 +2075,15 @@ fn duration(secs: u32) -> String {
         return "-".into();
     }
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn hms(secs: u64) -> String {
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+fn clock() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    hms(now % 86400)
 }
 
 fn open_path(p: &std::path::Path) {
@@ -1649,3 +2098,41 @@ fn open_path(p: &std::path::Path) {
         tracing::warn!("open {}: {e}", p.display());
     }
 }
+
+const HELP: &[(&str, &str)] = &[
+    (
+        "Getting Started",
+        "Choose File > Preferences to set your user name, password, the server to connect to, and the folders \
+         you want to share. Then use File > Connect. New user names are registered automatically the first \
+         time you log in.",
+    ),
+    (
+        "Search",
+        "Type an artist and/or song title and click Find It!. The Advanced Fields narrow results by bitrate, \
+         frequency and the sharer's line speed. Double-click a result, or select several and click Get Selected \
+         Song(s), to download. Right-click a result for more options.",
+    ),
+    (
+        "Transfer",
+        "Downloads are listed on top and uploads below. Partial downloads are kept in the Incomplete folder and \
+         resume automatically. Select a transfer and click Cancel to stop it; double-click a finished download to \
+         open it.",
+    ),
+    (
+        "Hot List",
+        "Add users to your Hot List to see when they are online. Double-click a user to browse the files they are \
+         sharing.",
+    ),
+    (
+        "Chat",
+        "Join rooms from Discover (or Join Chat Rooms...). Commands: /join <room>, /part, /msg <user> <text>, \
+         /me <action>, /topic <text>, /whois <user>, /ping <user>, /serverping, /browse <user>, /ignore <user>, \
+         /unignore <user>, /hotlist <user>, /clear, /raw <numeric> <data>.",
+    ),
+    (
+        "Firewalls",
+        "Other users connect to your Data Port (6699 by default) to download your files. If they can't, set the \
+         Data Port to 0: you can still share, and your uploads are pushed out instead. Two firewalled users \
+         cannot transfer files with each other.",
+    ),
+];

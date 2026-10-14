@@ -33,6 +33,8 @@ pub struct ClientConfig {
     pub cache_library: bool,
     /// Connect when the app starts (the original did).
     pub auto_connect: bool,
+    /// Cap on each upload's speed in KB/s (0 = unlimited).
+    pub upload_limit_kbps: u32,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +62,7 @@ impl Default for ClientConfig {
             bind_host: "0.0.0.0".into(),
             cache_library: true,
             auto_connect: true,
+            upload_limit_kbps: 0,
         }
     }
 }

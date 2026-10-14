@@ -177,10 +177,23 @@ async fn send_file<W: AsyncWrite + Unpin>(
     });
     let result: std::io::Result<u64> = async {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut buf = vec![0u8; CHUNK];
+        let limit = shared.config().upload_limit_kbps as u64 * 1024;
+        // with a limit, send in quarter-second slices so the rate is smooth
+        let chunk = if limit > 0 { (limit / 4).clamp(1024, CHUNK as u64) as usize } else { CHUNK };
+        let mut buf = vec![0u8; chunk];
         let mut sent = 0u64;
         let mut last = Instant::now();
+        let began = Instant::now();
         loop {
+            if limit > 0 {
+                let due = Duration::from_secs_f64(sent as f64 / limit as f64);
+                if let Some(wait) = due.checked_sub(began.elapsed()) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(std::io::Error::other("cancelled")),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            }
             let n = file.read(&mut buf).await?;
             if n == 0 {
                 break;
